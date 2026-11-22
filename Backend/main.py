@@ -25,6 +25,7 @@ import yt_dlp
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -45,11 +46,14 @@ SMTP_EMAIL = os.getenv("SMTP_EMAIL", "rahulgoudapatil7@gmail.com")
 SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")  # Paste your 16-char Gmail App Password here (no spaces)
 
 BASE_DIR = Path(__file__).resolve().parent
-CLIPS_DIR = BASE_DIR / "clips"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
+CLIPS_DIR = DATA_DIR / "clips"
 FFMPEG_DIR = BASE_DIR / "ffmpeg_bin"
-DB_PATH = BASE_DIR / "viralcut.db"
-SECRET_PATH = BASE_DIR / ".auth_secret"
+DB_PATH = DATA_DIR / "viralcut.db"
+SECRET_PATH = DATA_DIR / ".auth_secret"
+FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 FFMPEG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1164,7 +1168,6 @@ class CutClipRequest(BaseModel):
     caption_theme: str = "gold"
 
 
-@app.get("/")
 @app.get("/api/health")
 def health():
     return {
@@ -1701,3 +1704,30 @@ def serve_clip_file(filename: str, download: int = 0):
     if download:
         return FileResponse(path, media_type="video/mp4", filename=safe_name)
     return FileResponse(path, media_type="video/mp4")
+
+
+# ---------- SERVE BUILT REACT FRONTEND IN PRODUCTION ----------
+if (FRONTEND_DIST / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+
+
+@app.get("/")
+def serve_root():
+    index_file = FRONTEND_DIST / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return health()
+
+
+@app.get("/{full_path:path}")
+def serve_spa_fallback(full_path: str):
+    if full_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="API endpoint not found.")
+    candidate = FRONTEND_DIST / full_path
+    if candidate.is_file():
+        return FileResponse(candidate)
+    index_file = FRONTEND_DIST / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    raise HTTPException(status_code=404, detail="Not found.")
+
