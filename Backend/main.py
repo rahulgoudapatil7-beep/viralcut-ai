@@ -45,17 +45,53 @@ ADMIN_EMAILS = {"rahulgoudapatil7@gmail.com"}
 SMTP_EMAIL = os.getenv("SMTP_EMAIL", "rahulgoudapatil7@gmail.com")
 SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")  # Paste your 16-char Gmail App Password here (no spaces)
 
+# CLOUD YOUTUBE BYPASS (for Render/Railway where YouTube blocks datacenter IPs)
+# Option A: Set PROXY_URL env var in Render (e.g. http://user:pass@p.webshare.io:80)
+# Option B: Set YOUTUBE_COOKIES or YOUTUBE_COOKIES_B64 env var in Render (exported Netscape cookies.txt)
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
 CLIPS_DIR = DATA_DIR / "clips"
 FFMPEG_DIR = BASE_DIR / "ffmpeg_bin"
 DB_PATH = DATA_DIR / "viralcut.db"
 SECRET_PATH = DATA_DIR / ".auth_secret"
+COOKIES_PATH = DATA_DIR / "cookies.txt"
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 FFMPEG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def setup_youtube_cookies() -> str | None:
+    """Load YouTube cookies from YOUTUBE_COOKIES / YOUTUBE_COOKIES_B64 env var or local cookies.txt."""
+    b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    raw = os.getenv("YOUTUBE_COOKIES", "").strip()
+    try:
+        if b64:
+            decoded = base64.b64decode(b64).decode("utf-8", errors="ignore")
+            if decoded.strip():
+                COOKIES_PATH.write_text(decoded, encoding="utf-8")
+                print(f"COOKIES CHECK: Loaded from YOUTUBE_COOKIES_B64 ({COOKIES_PATH})")
+                return str(COOKIES_PATH)
+        elif raw:
+            COOKIES_PATH.write_text(raw, encoding="utf-8")
+            print(f"COOKIES CHECK: Loaded from YOUTUBE_COOKIES ({COOKIES_PATH})")
+            return str(COOKIES_PATH)
+    except Exception as exc:
+        print(f"COOKIES CHECK: Failed reading env cookies -> {exc}")
+
+    for candidate in (COOKIES_PATH, BASE_DIR / "cookies.txt"):
+        if candidate.exists() and candidate.stat().st_size > 20:
+            print(f"COOKIES CHECK: Using file {candidate}")
+            return str(candidate)
+    return None
+
+
+YOUTUBE_COOKIE_FILE = setup_youtube_cookies()
+if PROXY_URL:
+    print("PROXY CHECK: Residential/HTTP proxy enabled for YouTube requests")
 
 
 # ============================================================
@@ -360,6 +396,7 @@ def fetch_video_metadata(url: str, video_id: str) -> dict[str, Any]:
             "skip_download": True,
             "noplaylist": True,
             "socket_timeout": 12,
+            **get_ytdlp_js_opts(),
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -373,34 +410,171 @@ def fetch_video_metadata(url: str, video_id: str) -> dict[str, Any]:
     return {"title": title, "duration": duration, "thumbnail": thumbnail}
 
 
-def get_transcript(video_id: str) -> tuple[list[dict[str, Any]], str]:
-    """Fetch English transcript if available, otherwise fall back to any available language (e.g., Hindi)."""
-    api = YouTubeTranscriptApi()
-    if hasattr(api, "list"):
-        transcript_list = api.list(video_id)
-    else:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+def _parse_vtt_time(ts: str) -> float:
+    parts = ts.strip().replace(",", ".").split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return 0.0
 
-    try:
-        transcript = transcript_list.find_transcript(["en", "en-US", "en-GB", "en-IN"])
-    except Exception:
-        transcript = next(iter(transcript_list))
 
-    lang = getattr(transcript, "language_code", "auto")
-    fetched = transcript.fetch()
+def _parse_vtt_to_segments(vtt_text: str) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
-    for s in fetched:
-        if isinstance(s, dict):
-            text = str(s.get("text", "")).strip()
-            start = float(s.get("start", 0.0))
-            dur = float(s.get("duration", 2.0))
+    blocks = re.split(r"\r?\n\r?\n", vtt_text)
+    for block in blocks:
+        lines = [l.strip() for l in block.splitlines() if l.strip()]
+        time_idx = next((i for i, l in enumerate(lines) if "-->" in l), -1)
+        if time_idx < 0:
+            continue
+        m = re.search(r"([\d:.]+)\s*-->\s*([\d:.]+)", lines[time_idx])
+        if not m:
+            continue
+        start = _parse_vtt_time(m.group(1))
+        end = _parse_vtt_time(m.group(2))
+        text = " ".join(lines[time_idx + 1 :])
+        text = re.sub(r"<[^>]+>", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if text and end > start:
+            # Skip duplicate rolling caption lines
+            if segments and segments[-1]["text"] == text:
+                continue
+            segments.append({"text": text, "start": round(start, 2), "duration": round(max(0.5, end - start), 2)})
+    return segments
+
+
+def _get_transcript_via_ytdlp(video_id: str, url: str) -> tuple[list[dict[str, Any]], str]:
+    """Fallback transcript fetcher using yt-dlp (supports cookies.txt, proxy, and Android/TV clients)."""
+    tmp_dir = CLIPS_DIR / f"sub_{video_id}_{secrets.token_hex(4)}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        ydl_opts = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["en", "en-US", "en-IN", "hi", "hi-IN", "all"],
+            "subtitlesformat": "vtt/best",
+            "outtmpl": str(tmp_dir / "%(id)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 20,
+            "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
+            **get_ytdlp_js_opts(),
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url or f"https://www.youtube.com/watch?v={video_id}", download=False)
+            subs = info.get("subtitles") or {}
+            auto_subs = info.get("automatic_captions") or {}
+            combined = {**auto_subs, **subs}
+
+            # Pick preferred language
+            chosen_lang = None
+            for pref in ("en", "en-US", "en-GB", "en-IN", "hi", "hi-IN"):
+                if pref in combined:
+                    chosen_lang = pref
+                    break
+            if not chosen_lang and combined:
+                chosen_lang = next(iter(combined.keys()))
+            if not chosen_lang:
+                raise RuntimeError("No subtitles or auto-captions found for this video.")
+
+            formats = combined[chosen_lang]
+            vtt_entry = next((f for f in formats if f.get("ext") == "vtt" and f.get("url")), None)
+            json3_entry = next((f for f in formats if f.get("ext") == "json3" and f.get("url")), None)
+
+            opener = urllib.request.build_opener()
+            if PROXY_URL:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})
+                )
+
+            if json3_entry:
+                req = urllib.request.Request(json3_entry["url"], headers={"User-Agent": "Mozilla/5.0"})
+                with opener.open(req, timeout=15) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                segs: list[dict[str, Any]] = []
+                for ev in payload.get("events", []):
+                    t_ms = ev.get("tStartMs")
+                    d_ms = ev.get("dDurationMs", 2000)
+                    parts = ev.get("segs") or []
+                    txt = "".join(p.get("utf8", "") for p in parts)
+                    txt = re.sub(r"\s+", " ", txt).strip()
+                    if t_ms is not None and txt:
+                        segs.append({
+                            "text": txt,
+                            "start": round(t_ms / 1000.0, 2),
+                            "duration": round(max(0.5, d_ms / 1000.0), 2),
+                        })
+                if segs:
+                    return segs, chosen_lang
+
+            if vtt_entry:
+                req = urllib.request.Request(vtt_entry["url"], headers={"User-Agent": "Mozilla/5.0"})
+                with opener.open(req, timeout=15) as resp:
+                    vtt_text = resp.read().decode("utf-8", errors="ignore")
+                segs = _parse_vtt_to_segments(vtt_text)
+                if segs:
+                    return segs, chosen_lang
+
+            raise RuntimeError("Subtitle stream could not be parsed.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def get_transcript(video_id: str, url: str = "") -> tuple[list[dict[str, Any]], str]:
+    """Fetch English transcript if available, otherwise any language (e.g., Hindi). Auto-falls back to yt-dlp."""
+    first_err: Exception | None = None
+    try:
+        proxy_cfg = None
+        if PROXY_URL:
+            try:
+                from youtube_transcript_api.proxies import GenericProxyConfig
+                proxy_cfg = GenericProxyConfig(http_url=PROXY_URL, https_url=PROXY_URL)
+            except Exception:
+                proxy_cfg = None
+
+        api = YouTubeTranscriptApi(proxy_config=proxy_cfg) if proxy_cfg else YouTubeTranscriptApi()
+        if hasattr(api, "list"):
+            transcript_list = api.list(video_id)
         else:
-            text = str(getattr(s, "text", "")).strip()
-            start = float(getattr(s, "start", 0.0))
-            dur = float(getattr(s, "duration", 2.0))
-        if text:
-            segments.append({"text": text, "start": round(start, 2), "duration": round(dur, 2)})
-    return segments, lang
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+        try:
+            transcript = transcript_list.find_transcript(["en", "en-US", "en-GB", "en-IN"])
+        except Exception:
+            transcript = next(iter(transcript_list))
+
+        lang = getattr(transcript, "language_code", "auto")
+        fetched = transcript.fetch()
+        segments: list[dict[str, Any]] = []
+        for s in fetched:
+            if isinstance(s, dict):
+                text = str(s.get("text", "")).strip()
+                start = float(s.get("start", 0.0))
+                dur = float(s.get("duration", 2.0))
+            else:
+                text = str(getattr(s, "text", "")).strip()
+                start = float(getattr(s, "start", 0.0))
+                dur = float(getattr(s, "duration", 2.0))
+            if text:
+                segments.append({"text": text, "start": round(start, 2), "duration": round(dur, 2)})
+        if segments:
+            return segments, lang
+    except Exception as exc:
+        first_err = exc
+        print(f"[TRANSCRIPT] Primary API blocked/failed ({str(exc)[:120]}), trying yt-dlp fallback...")
+
+    # Fallback: yt-dlp with cookies/proxy/mobile client
+    try:
+        return _get_transcript_via_ytdlp(video_id, url)
+    except Exception as exc2:
+        err_msg = str(first_err or exc2)
+        if "blocking" in err_msg.lower() or "bot" in err_msg.lower() or "sign in" in err_msg.lower():
+            raise RuntimeError(
+                "YouTube is blocking this cloud server's IP. Add PROXY_URL (free Webshare residential proxy) or YOUTUBE_COOKIES in Render Environment Variables — or click 'Try Instant Demo Video' to test right now!"
+            ) from exc2
+        raise RuntimeError(err_msg[:180]) from exc2
 
 
 STOP_WORDS = {
@@ -820,10 +994,15 @@ def encode_smooth_clip(
 
 
 def get_ytdlp_js_opts() -> dict[str, Any]:
-    """Enable Node.js for yt-dlp if installed so YouTube 1080p formats work cleanly."""
+    """Common yt-dlp options: Node.js runtime + optional YouTube cookies + optional proxy."""
+    opts: dict[str, Any] = {}
     if shutil.which("node"):
-        return {"js_runtimes": {"node": {}}}
-    return {}
+        opts["js_runtimes"] = {"node": {}}
+    if YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists():
+        opts["cookiefile"] = YOUTUBE_COOKIE_FILE
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
+    return opts
 
 
 def cut_youtube_section(
@@ -1513,11 +1692,11 @@ def analyze_video(body: AnalyzeRequest, user: dict[str, Any] = Depends(get_curre
     max_clips = body.max_clips if body.max_clips in (5, 10, 20) else 5
 
     try:
-        segments, lang = get_transcript(video_id)
+        segments, lang = get_transcript(video_id, url=url)
     except Exception as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"No transcript available for this video ({str(exc)[:140]}). Try a video with captions enabled, or click 'Try Demo Video'.",
+            detail=f"Could not read YouTube transcript: {str(exc)[:240]}",
         )
 
     meta = fetch_video_metadata(url, video_id)
