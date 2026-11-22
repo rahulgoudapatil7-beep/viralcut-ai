@@ -1,0 +1,11 @@
+﻿services:
+  - type: web
+    name: viralcut-ai
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: SMTP_EMAIL
+        value: rahulgoudapatil7@gmail.com
+      - key: SMTP_APP_PASSWORD
+        sync: false
