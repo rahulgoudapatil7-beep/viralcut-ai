@@ -37,4 +37,4 @@ WORKDIR /app/backend
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port "]
+CMD ["python", "-c", "import os, uvicorn; uvicorn.run('main:app', host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))"]
