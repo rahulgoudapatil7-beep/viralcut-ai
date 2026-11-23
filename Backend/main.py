@@ -66,33 +66,98 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 FFMPEG_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _normalize_netscape_cookies(raw: str) -> tuple[str, int]:
+    """Repair pasted Netscape cookies (adds header if missing, fixes spaces->tabs) and count valid cookies."""
+    from http.cookiejar import MozillaCookieJar
+    import tempfile
+
+    text = raw.strip().lstrip("\ufeff")
+    if "\\n" in text and "\n" not in text:
+        text = text.replace("\\n", "\n").replace("\\t", "\t")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    out_lines = ["# Netscape HTTP Cookie File"]
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            # Preserve #HttpOnly_ cookie lines!
+            if not stripped.startswith("#HttpOnly_"):
+                continue
+        if "\t" in stripped:
+            parts = stripped.split("\t")
+            if len(parts) >= 7:
+                out_lines.append("\t".join(parts[:6] + ["\t".join(parts[6:])]))
+                continue
+        # Fallback if textarea converted tabs to spaces
+        ws_parts = stripped.split(None, 6)
+        if len(ws_parts) == 7 and ws_parts[1].upper() in ("TRUE", "FALSE") and ws_parts[3].upper() in ("TRUE", "FALSE"):
+            out_lines.append("\t".join(ws_parts))
+
+    normalized = "\n".join(out_lines) + "\n"
+    count = 0
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", encoding="utf-8", delete=False) as tf:
+            tf.write(normalized)
+            tmp_path = tf.name
+        try:
+            cj = MozillaCookieJar(tmp_path)
+            cj.load(ignore_discard=True, ignore_expires=True)
+            count = len(cj)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+    except Exception as exc:
+        print(f"COOKIES CHECK: MozillaCookieJar validation warning -> {exc}")
+    return normalized, count
+
+
+YOUTUBE_COOKIES_COUNT = 0
+
+
 def setup_youtube_cookies() -> str | None:
-    """Load YouTube cookies from YOUTUBE_COOKIES / YOUTUBE_COOKIES_B64 env var or local cookies.txt."""
+    """Load YouTube cookies from Render Secret File, YOUTUBE_COOKIES_B64, YOUTUBE_COOKIES, or local cookies.txt."""
+    global YOUTUBE_COOKIES_COUNT
+
+    # 1. Check Render Secret Files (/etc/secrets/cookies.txt) first — zero paste corruption!
+    for secret_file in (Path("/etc/secrets/cookies.txt"), BASE_DIR / "cookies.txt"):
+        if secret_file.exists() and secret_file.stat().st_size > 20:
+            raw_text = secret_file.read_text(encoding="utf-8", errors="ignore")
+            norm, cnt = _normalize_netscape_cookies(raw_text)
+            COOKIES_PATH.write_text(norm, encoding="utf-8")
+            YOUTUBE_COOKIES_COUNT = cnt
+            print(f"COOKIES CHECK: Loaded {cnt} cookies from file {secret_file}")
+            return str(COOKIES_PATH)
+
+    # 2. Check environment variables (YOUTUBE_COOKIES_B64 or YOUTUBE_COOKIES)
     b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     raw = os.getenv("YOUTUBE_COOKIES", "").strip()
     try:
+        source_label = ""
+        decoded = ""
         if b64:
-            # Strip accidental whitespace/newlines inside base64 string
             clean_b64 = re.sub(r"\s+", "", b64)
             decoded = base64.b64decode(clean_b64).decode("utf-8", errors="ignore")
-            if decoded.strip():
-                COOKIES_PATH.write_text(decoded, encoding="utf-8")
-                print(f"COOKIES CHECK: Loaded from YOUTUBE_COOKIES_B64 ({COOKIES_PATH})")
-                return str(COOKIES_PATH)
+            source_label = "YOUTUBE_COOKIES_B64"
         elif raw:
-            # Handle literal \n if Render UI flattened multiline paste
-            if "\\n" in raw and "\n" not in raw:
-                raw = raw.replace("\\n", "\n").replace("\\t", "\t")
-            COOKIES_PATH.write_text(raw, encoding="utf-8")
-            print(f"COOKIES CHECK: Loaded from YOUTUBE_COOKIES ({COOKIES_PATH})")
+            decoded = raw
+            source_label = "YOUTUBE_COOKIES"
+
+        if decoded.strip():
+            norm, cnt = _normalize_netscape_cookies(decoded)
+            COOKIES_PATH.write_text(norm, encoding="utf-8")
+            YOUTUBE_COOKIES_COUNT = cnt
+            print(f"COOKIES CHECK: Loaded {cnt} cookies from {source_label} ({COOKIES_PATH})")
             return str(COOKIES_PATH)
     except Exception as exc:
         print(f"COOKIES CHECK: Failed reading env cookies -> {exc}")
 
-    for candidate in (COOKIES_PATH, BASE_DIR / "cookies.txt"):
-        if candidate.exists() and candidate.stat().st_size > 20:
-            print(f"COOKIES CHECK: Using file {candidate}")
-            return str(candidate)
+    if COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 20:
+        raw_text = COOKIES_PATH.read_text(encoding="utf-8", errors="ignore")
+        norm, cnt = _normalize_netscape_cookies(raw_text)
+        YOUTUBE_COOKIES_COUNT = cnt
+        print(f"COOKIES CHECK: Using existing file {COOKIES_PATH} ({cnt} cookies)")
+        return str(COOKIES_PATH)
     return None
 
 
@@ -680,8 +745,9 @@ def get_transcript(video_id: str, url: str = "") -> tuple[list[dict[str, Any]], 
     combined = " | ".join(errors)
     low = combined.lower()
     if any(k in low for k in ("blocking", "bot", "sign in", "ip", "429", "forbidden", "login_required")):
+        detail = f" [Details: {errors[0]}]" if has_cookies and errors else ""
         raise RuntimeError(
-            "YouTube blocked this cloud server's IP. Easy fix: click 'Upload Video (MP4)' right above (100% free & never blocked), or add YOUTUBE_COOKIES_B64 in Render Environment Variables to unlock YouTube links!"
+            "YouTube blocked this cloud server's IP. Easy fix: click 'Upload Video (MP4)' right above (100% free & never blocked), or refresh cookies.txt in Render Secret Files!" + detail
         )
     raise RuntimeError(errors[0] if errors else "Could not fetch YouTube transcript.")
 
@@ -1468,6 +1534,7 @@ def health():
         "captions_enabled": CAPTIONS,
         "upload_enabled": True,
         "youtube_cookies_loaded": bool(YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists()),
+        "youtube_cookies_count": YOUTUBE_COOKIES_COUNT,
         "proxy_configured": bool(PROXY_URL),
     }
 
@@ -2236,3 +2303,4 @@ def serve_spa_fallback(full_path: str):
     if index_file.exists():
         return FileResponse(index_file)
     raise HTTPException(status_code=404, detail="Not found.")
+
