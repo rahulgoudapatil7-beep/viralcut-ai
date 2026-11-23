@@ -1,4 +1,5 @@
-﻿FROM node:20-slim AS frontend-builder
+# ViralCut AI — Single-Container Production Dockerfile (Frontend + FastAPI + FFmpeg + Hindi Fonts)
+FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
@@ -8,6 +9,7 @@ RUN npm run build
 FROM python:3.12-slim
 WORKDIR /app
 
+# Install FFmpeg, Node.js (for yt-dlp JS runtime), and Hindi/Devanagari + Latin fonts
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     nodejs \
@@ -18,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
+# Support either "backend/" or Windows "Backend/" folder name automatically
 COPY . /tmp/repo
 RUN if [ -d /tmp/repo/Backend ]; then cp -r /tmp/repo/Backend /app/backend; \
     else cp -r /tmp/repo/backend /app/backend; fi \
@@ -26,11 +29,13 @@ RUN if [ -d /tmp/repo/Backend ]; then cp -r /tmp/repo/Backend /app/backend; \
 RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
+    python-multipart \
     yt-dlp \
     youtube-transcript-api \
     imageio-ffmpeg \
     httpx
 
+# Copy built React app into /app/frontend/dist so FastAPI serves it at /
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
 
 WORKDIR /app/backend
