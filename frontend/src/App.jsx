@@ -1,1531 +1,1691 @@
-* {
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-  background: #090912;
-  color: #f5f3ff;
-  font-family: Inter, system-ui, -apple-system, Arial, sans-serif;
-}
-
-a {
-  color: inherit;
-  text-decoration: none;
-}
-
-button,
-input {
-  font-family: inherit;
-}
-
-/* ==================== AUTH PAGES (LOGIN & REGISTER) ==================== */
-.auth-shell {
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  position: relative;
-  overflow: hidden;
-  background: radial-gradient(circle at top center, #211044 0%, #090912 60%);
-}
-
-.auth-glow {
-  position: absolute;
-  width: 520px;
-  height: 520px;
-  border-radius: 50%;
-  background: rgba(128, 47, 255, 0.16);
-  filter: blur(110px);
-  pointer-events: none;
-}
-
-.auth-card {
-  position: relative;
-  width: 100%;
-  max-width: 430px;
-  background: #121220;
-  border: 1px solid #2b2940;
-  border-radius: 20px;
-  padding: 32px 28px;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
-}
-
-.auth-brand {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin-bottom: 24px;
-}
-
-.brand-badge {
-  width: 46px;
-  height: 46px;
-  border-radius: 13px;
-  background: linear-gradient(135deg, #802fff, #a66aff);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #fff;
-}
-
-.auth-brand h2 {
-  margin: 0;
-  font-size: 22px;
-}
-
-.auth-brand h2 span {
-  color: #a66aff;
-}
-
-.auth-brand p {
-  margin: 2px 0 0;
-  font-size: 13px;
-  color: #9e9cb5;
-}
-
-.auth-tabs {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-  background: #0c0c16;
-  padding: 5px;
-  border-radius: 12px;
-  border: 1px solid #242336;
-  margin-bottom: 22px;
-}
-
-.auth-tabs button {
-  border: 0;
-  background: transparent;
-  color: #a4a2ba;
-  padding: 10px 12px;
-  border-radius: 9px;
-  font-weight: 600;
-  font-size: 14px;
-  cursor: pointer;
-  transition: 0.18s;
-}
-
-.auth-tabs button.active {
-  background: #802fff;
-  color: #fff;
-}
-
-.auth-form {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.field span {
-  font-size: 13px;
-  color: #c5c2d9;
-  font-weight: 500;
-}
-
-.field-input {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  background: #171728;
-  border: 1px solid #302e47;
-  border-radius: 11px;
-  padding: 0 13px;
-  color: #9794b0;
-}
-
-.field-input:focus-within {
-  border-color: #9252ff;
-  box-shadow: 0 0 0 3px rgba(146, 82, 255, 0.18);
-}
-
-.field-input input {
-  flex: 1;
-  background: transparent;
-  border: 0;
-  outline: 0;
-  color: #fff;
-  padding: 12px 0;
-  font-size: 14px;
-}
-
-.field-label-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.small-link {
-  font-size: 12px;
-}
-
-.eye-btn {
-  background: transparent;
-  border: 0;
-  color: #9e9bb8;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 4px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-
-.eye-btn:hover {
-  color: #fff;
-}
-
-.forgot-header {
-  margin-bottom: 18px;
-}
-
-.forgot-header h3 {
-  margin: 10px 0 4px;
-  font-size: 18px;
-}
-
-.forgot-header p {
-  margin: 0;
-  font-size: 13px;
-  color: #9e9cb5;
-  line-height: 1.45;
-}
-
-.back-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12.5px;
-}
-
-.auth-footer {
-  margin-top: 20px;
-  text-align: center;
-  font-size: 13px;
-  color: #9e9cb5;
-}
-
-.link-btn {
-  background: none;
-  border: 0;
-  color: #b486ff;
-  font-weight: 600;
-  cursor: pointer;
-  padding: 0;
-}
-
-.link-btn:hover {
-  text-decoration: underline;
-}
-
-.loading-pill {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 14px 22px;
-  background: #141424;
-  border: 1px solid #2b2940;
-  border-radius: 999px;
-  color: #dcd8f5;
-}
-
-/* ==================== APP LAYOUT ==================== */
-.app {
-  display: flex;
-  min-height: 100vh;
-}
-
-.sidebar {
-  width: 252px;
-  padding: 26px 18px;
-  background: #10101b;
-  border-right: 1px solid #252438;
-  display: flex;
-  flex-direction: column;
-  flex-shrink: 0;
-}
-
-.logo-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 0 8px;
-}
-
-.logo-row h2 {
-  margin: 0;
-  font-size: 22px;
-}
-
-.logo-row h2 span {
-  color: #a66aff;
-}
-
-.accent-icon {
-  color: #a66aff;
-}
-
-nav {
-  margin-top: 30px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-nav button {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 14px;
-  background: transparent;
-  border: 0;
-  color: #aaa8bd;
-  border-radius: 11px;
-  cursor: pointer;
-  font-size: 14px;
-  font-weight: 500;
-  text-align: left;
-  transition: 0.16s;
-}
-
-nav button:hover {
-  background: #1a192b;
-  color: #fff;
-}
-
-nav button.active {
-  background: #35146d;
-  color: #fff;
-}
-
-.nav-badge {
-  margin-left: auto;
-  background: #24193f;
-  color: #c8a8ff;
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.side-bottom {
-  margin-top: auto;
-  padding: 16px;
-  border-radius: 14px;
-  background: #171528;
-  border: 1px solid #2b2745;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.user-mini {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.avatar {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  background: linear-gradient(135deg, #802fff, #a66aff);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  font-size: 13px;
-  flex-shrink: 0;
-}
-
-.user-meta {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.user-meta strong {
-  font-size: 13px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.user-meta span {
-  font-size: 11px;
-  color: #9693ae;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.logout-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 9px 14px;
-  border-radius: 9px;
-  background: #231932;
-  border: 1px solid #3c2b59;
-  color: #e6d9ff;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-}
-
-.logout-btn:hover {
-  background: #3b1d2e;
-  border-color: #6b2944;
-  color: #ffccd8;
-}
-
-/* ==================== MAIN WORKSPACE ==================== */
-main {
-  flex: 1;
-  padding: 28px 4%;
-  min-width: 0;
-}
-
-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 14px;
-  flex-wrap: wrap;
-}
-
-.header-left,
-.header-right {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.workspace-label {
-  color: #aaa8bd;
-  font-size: 12px;
-  letter-spacing: 0.08em;
-  font-weight: 600;
-}
-
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  background: rgba(34, 197, 94, 0.12);
-  color: #86efac;
-  border: 1px solid rgba(34, 197, 94, 0.25);
-}
-
-.caption-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 8px 13px;
-  border-radius: 9px;
-  background: #171726;
-  border: 1px solid #333049;
-  color: #a8a6be;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-}
-
-.caption-toggle.on {
-  background: #25154a;
-  border-color: #6936d6;
-  color: #dfd0ff;
-}
-
-.theme-picker {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  background: #141423;
-  border: 1px solid #2e2c45;
-  padding: 4px;
-  border-radius: 10px;
-}
-
-.theme-picker button {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  background: transparent;
-  border: 0;
-  color: #a8a6be;
-  padding: 5px 9px;
-  border-radius: 7px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.theme-picker button.active {
-  background: #291c4d;
-  color: #fff;
-}
-
-.color-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  display: inline-block;
-}
-
-.profile-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  background: #191827;
-  color: #fff;
-  border: 1px solid #38344c;
-  padding: 7px 14px 7px 8px;
-  border-radius: 999px;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.mini-dot {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  background: #802fff;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 11px;
-  font-weight: 700;
-}
-
-/* ==================== HERO ==================== */
-.hero {
-  margin: 44px 0 36px;
-}
-
-.tag {
-  color: #b68aff;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.hero h1 {
-  margin: 14px 0 12px;
-  font-size: clamp(34px, 4.6vw, 56px);
-  line-height: 1.08;
-  letter-spacing: -0.02em;
-}
-
-.hero h1 span {
-  color: #a66aff;
-}
-
-.hero p {
-  color: #aaa8bd;
-  max-width: 660px;
-  margin: 0 0 22px;
-  line-height: 1.55;
-}
-
-.url-box {
-  max-width: 860px;
-  display: flex;
-  gap: 10px;
-  padding: 8px 8px 8px 14px;
-  background: #171726;
-  border: 1px solid #38334f;
-  border-radius: 14px;
-  align-items: center;
-}
-
-.url-box:focus-within {
-  border-color: #8f4dff;
-}
-
-.url-icon {
-  color: #8f8ca8;
-  flex-shrink: 0;
-}
-
-.url-box input {
-  flex: 1;
-  min-width: 0;
-  background: transparent;
-  border: 0;
-  outline: 0;
-  color: #fff;
-  padding: 11px 4px;
-  font-size: 14px;
-}
-
-.hero-subrow {
-  max-width: 860px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 12px;
-  flex-wrap: wrap;
-}
-
-.clip-options-bar {
-  max-width: 860px;
-  display: flex;
-  align-items: center;
-  gap: 20px;
-  flex-wrap: wrap;
-  margin-top: 14px;
-  padding: 12px 14px;
-  background: #131322;
-  border: 1px solid #2b2940;
-  border-radius: 13px;
-}
-
-.option-group {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.opt-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: #b7b4cf;
-}
-
-.pill-group {
-  display: inline-flex;
-  gap: 5px;
-  background: #0b0b15;
-  padding: 4px;
-  border-radius: 9px;
-  border: 1px solid #26243a;
-}
-
-.pill-group button {
-  background: transparent;
-  border: 0;
-  color: #a4a1bd;
-  padding: 6px 12px;
-  border-radius: 7px;
-  font-size: 12.5px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: 0.15s;
-}
-
-.pill-group button:hover {
-  color: #fff;
-}
-
-.pill-group button.active {
-  background: #802fff;
-  color: #fff;
-}
-
-.meta-block {
-  background: #131322;
-  border: 1px solid #26243b;
-  border-radius: 10px;
-  padding: 10px 12px;
-  margin-bottom: 10px;
-}
-
-.meta-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 4px;
-}
-
-.meta-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  color: #a66aff;
-}
-
-.copy-mini {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  background: #1f1e33;
-  border: 1px solid #33304d;
-  color: #d6d2ee;
-  padding: 3px 8px;
-  border-radius: 6px;
-  font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.copy-mini:hover {
-  background: #2f2854;
-  border-color: #7c4dff;
-  color: #fff;
-}
-
-.clip-desc {
-  margin: 0;
-  font-size: 12.5px;
-  color: #c7c4dc;
-  line-height: 1.5;
-  white-space: pre-line;
-}
-
-.clip-desc.clamp {
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.hashtag-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.hashtag-chip {
-  font-size: 11.5px;
-  color: #cbb0ff;
-  background: rgba(128, 47, 255, 0.16);
-  border: 1px solid rgba(166, 106, 255, 0.28);
-  padding: 3px 8px;
-  border-radius: 999px;
-}
-
-.mt-8 {
-  margin-top: 8px;
-}
-
-.hero-subrow small {
-  color: #88869e;
-  font-size: 12.5px;
-}
-
-.hero-quick-btns {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.upload-label.disabled {
-  opacity: 0.55;
-  pointer-events: none;
-}
-
-/* ==================== BUTTONS & ALERTS ==================== */
-.primary-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  background: linear-gradient(135deg, #802fff, #954dff);
-  color: #fff;
-  border: 0;
-  padding: 12px 18px;
-  border-radius: 10px;
-  font-weight: 600;
-  font-size: 14px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.primary-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.primary-btn.full {
-  width: 100%;
-}
-
-.ghost-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: #1a192b;
-  border: 1px solid #35324e;
-  color: #dedaf5;
-  padding: 8px 13px;
-  border-radius: 9px;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-}
-
-.ghost-btn:hover {
-  background: #25233b;
-}
-
-.ghost-btn.small,
-.cut-btn.small {
-  padding: 7px 11px;
-  font-size: 12.5px;
-}
-
-.cut-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  background: #802fff;
-  color: #fff;
-  border: 0;
-  padding: 8px 13px;
-  border-radius: 8px;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.cut-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.icon-btn {
-  background: #1c1b2d;
-  border: 1px solid #302e46;
-  color: #c7c4de;
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-
-.icon-btn.danger:hover {
-  background: #3d1826;
-  border-color: #7c2d45;
-  color: #fda4af;
-}
-
-.alert {
-  max-width: 860px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 14px;
-  border-radius: 11px;
-  font-size: 13.5px;
-  line-height: 1.45;
-}
-
-.alert.error {
-  background: rgba(239, 68, 68, 0.12);
-  border: 1px solid rgba(239, 68, 68, 0.35);
-  color: #fca5a5;
-}
-
-.alert.success {
-  background: rgba(34, 197, 94, 0.12);
-  border: 1px solid rgba(34, 197, 94, 0.32);
-  color: #86efac;
-}
-
-.alert.info {
-  background: rgba(128, 47, 255, 0.16);
-  border: 1px solid rgba(166, 106, 255, 0.35);
-  color: #d8c2ff;
-}
-
-.alert.warn {
-  background: rgba(245, 158, 11, 0.12);
-  border: 1px solid rgba(245, 158, 11, 0.35);
-  color: #fcd34d;
-}
-
-.mt-12 {
-  margin-top: 12px;
-}
-
-.mt-16 {
-  margin-top: 16px;
-}
-
-.spin {
-  animation: spin 1s linear infinite;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
+import { useEffect, useState } from "react";
+import {
+  Scissors,
+  Home,
+  FolderOpen,
+  Settings,
+  Plus,
+  Sparkles,
+  Play,
+  Clock,
+  Download,
+  TrendingUp,
+  Zap,
+  Link as LinkIcon,
+  Film,
+  LogOut,
+  User,
+  Mail,
+  Lock,
+  CheckCircle2,
+  AlertCircle,
+  Trash2,
+  ExternalLink,
+  Subtitles,
+  Loader2,
+  X,
+  ShieldCheck,
+  Copy,
+  Check,
+  Hash,
+  Timer,
+  Layers,
+  Users,
+  Search,
+  RefreshCw,
+  Eye,
+  EyeOff,
+  KeyRound,
+  ArrowLeft,
+  Upload,
+} from "lucide-react";
+import "./App.css";
+
+const API_BASE = "/api";
+
+function formatTime(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}:${String(rem).padStart(2, "0")}`;
+}
+
+function ScoreRing({ score }) {
+  const valid = typeof score === "number" && score > 0;
+  const pct = valid ? Math.min(100, Math.max(0, score)) : 0;
+  const r = 42;
+  const circ = 2 * Math.PI * r;
+  const offset = circ - (pct / 100) * circ;
+
+  return (
+    <div className="score-ring">
+      <svg width="106" height="106" viewBox="0 0 106 106">
+        <circle cx="53" cy="53" r={r} className="ring-bg" />
+        <circle
+          cx="53"
+          cy="53"
+          r={r}
+          className="ring-fg"
+          strokeDasharray={circ}
+          strokeDashoffset={offset}
+        />
+      </svg>
+      <div className="ring-center">
+        <strong>{valid ? score : "--"}</strong>
+        <span>VIRAL</span>
+      </div>
+    </div>
+  );
+}
+
+function AuthScreen({ onAuthSuccess }) {
+  const [mode, setMode] = useState("login"); // "login" | "register" | "forgot"
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+
+  // Forgot password state
+  const [resetStep, setResetStep] = useState(1); // 1 = request code, 2 = enter code + new password
+  const [resetCode, setResetCode] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+
+  function switchMode(next) {
+    setMode(next);
+    setError("");
+    setInfo("");
+    setShowPassword(false);
+    if (next === "forgot") {
+      setResetStep(1);
+      setResetCode("");
+      setNewPassword("");
+    }
   }
-}
 
-/* ==================== STATS & PANELS ==================== */
-.stats {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 16px;
-}
-
-.stat-card,
-.panel {
-  background: #141421;
-  border: 1px solid #29283b;
-  border-radius: 15px;
-  padding: 20px;
-}
-
-.stat-card svg {
-  color: #a66aff;
-}
-
-.stat-card span {
-  display: block;
-  color: #aaa8bd;
-  font-size: 13px;
-  margin-top: 10px;
-}
-
-.stat-card h2 {
-  margin: 6px 0 0;
-  font-size: 28px;
-}
-
-.content {
-  display: grid;
-  grid-template-columns: 1.15fr 1.25fr;
-  gap: 18px;
-  margin-top: 22px;
-  align-items: start;
-}
-
-.panel-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 16px;
-}
-
-.panel h3 {
-  margin: 0;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  font-size: 16px;
-}
-
-.muted-pill {
-  font-size: 12px;
-  color: #a5a2bb;
-  background: #1d1c2e;
-  padding: 4px 10px;
-  border-radius: 999px;
-}
-
-.empty {
-  min-height: 200px;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  align-items: center;
-  text-align: center;
-  color: #aaa8bd;
-  padding: 20px;
-}
-
-.empty.large {
-  min-height: 300px;
-}
-
-.empty svg {
-  color: #a66aff;
-  margin-bottom: 10px;
-}
-
-.empty h3 {
-  color: #fff;
-  margin: 4px 0 6px;
-}
-
-.empty p {
-  font-size: 13.5px;
-  max-width: 380px;
-  margin: 0;
-  line-height: 1.5;
-}
-
-/* ==================== PROJECTS LIST ==================== */
-.project-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.project-card {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 12px;
-  border-radius: 12px;
-  background: #191929;
-  border: 1px solid #2b2940;
-  cursor: pointer;
-  transition: 0.16s;
-}
-
-.project-card:hover {
-  border-color: #4c3a7a;
-}
-
-.project-card.selected {
-  border-color: #8f4dff;
-  background: #1e1834;
-}
-
-.project-thumb {
-  position: relative;
-  width: 96px;
-  height: 58px;
-  border-radius: 8px;
-  overflow: hidden;
-  background: #0d0d17;
-  flex-shrink: 0;
-}
-
-.project-thumb img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.thumb-fallback {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #8f4dff;
-}
-
-.dur-badge {
-  position: absolute;
-  bottom: 4px;
-  right: 4px;
-  font-size: 11px;
-  padding: 2px 5px;
-  border-radius: 5px;
-  background: rgba(0, 0, 0, 0.78);
-  color: #fff;
-}
-
-.project-info {
-  flex: 1;
-  min-width: 0;
-}
-
-.project-info h4 {
-  margin: 0 0 6px;
-  font-size: 14px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.project-meta {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  font-size: 12px;
-  color: #9e9cb5;
-}
-
-.accent-text {
-  color: #c097ff;
-  font-weight: 600;
-}
-
-/* ==================== AI CLIP INTELLIGENCE ==================== */
-.intel-summary {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  padding: 14px;
-  background: #19182b;
-  border: 1px solid #2d2a45;
-  border-radius: 13px;
-  margin-bottom: 16px;
-}
-
-.intel-summary h4 {
-  margin: 4px 0 6px;
-  font-size: 15px;
-}
-
-.intel-summary p {
-  margin: 0;
-  font-size: 12.5px;
-  color: #a6a3bd;
-  line-height: 1.45;
-}
-
-.mini-tag {
-  font-size: 11px;
-  color: #b68aff;
-  letter-spacing: 0.06em;
-  font-weight: 700;
-}
-
-.score-ring {
-  position: relative;
-  width: 106px;
-  height: 106px;
-  flex-shrink: 0;
-}
-
-.score-ring svg {
-  transform: rotate(-90deg);
-}
-
-.ring-bg {
-  fill: none;
-  stroke: #2a2742;
-  stroke-width: 9;
-}
-
-.ring-fg {
-  fill: none;
-  stroke: #9c5eff;
-  stroke-width: 9;
-  stroke-linecap: round;
-  transition: stroke-dashoffset 0.5s ease;
-}
-
-.ring-center {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-}
-
-.ring-center strong {
-  font-size: 24px;
-  line-height: 1;
-}
-
-.ring-center span {
-  font-size: 10px;
-  color: #a8a4be;
-  margin-top: 3px;
-  letter-spacing: 0.08em;
-}
-
-.suggestions-list {
-  display: flex;
-  flex-direction: column;
-  gap: 11px;
-}
-
-.suggestion-card {
-  background: #191929;
-  border: 1px solid #2b2940;
-  border-radius: 12px;
-  padding: 13px 14px;
-}
-
-.sug-top {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 8px;
-}
-
-.rank-badge {
-  background: #2c1b52;
-  color: #cbb0ff;
-  font-size: 11.5px;
-  font-weight: 700;
-  padding: 3px 8px;
-  border-radius: 6px;
-}
-
-.time-pill {
-  font-size: 12px;
-  color: #c5c2da;
-  background: #232238;
-  padding: 3px 8px;
-  border-radius: 6px;
-}
-
-.score-pill {
-  font-size: 12px;
-  font-weight: 600;
-  color: #d7beff;
-  background: rgba(128, 47, 255, 0.22);
-  padding: 3px 8px;
-  border-radius: 6px;
-}
-
-.clipped-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11.5px;
-  font-weight: 600;
-  color: #86efac;
-  background: rgba(34, 197, 94, 0.14);
-  padding: 3px 8px;
-  border-radius: 6px;
-}
-
-.suggestion-card h5 {
-  margin: 0 0 5px;
-  font-size: 14px;
-  line-height: 1.4;
-}
-
-.sug-reason {
-  margin: 0 0 11px;
-  font-size: 12px;
-  color: #9794b0;
-}
-
-.sug-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-/* ==================== MY CLIPS / TEMPLATES / SETTINGS ==================== */
-.page-section {
-  margin-top: 32px;
-}
-
-.section-header {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 22px;
-  flex-wrap: wrap;
-}
-
-.section-header h1 {
-  margin: 0 0 6px;
-  font-size: 30px;
-}
-
-.section-header p {
-  margin: 0;
-  color: #aaa8bd;
-  font-size: 14px;
-}
-
-.clips-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
-  gap: 18px;
-}
-
-.clip-card {
-  background: #141421;
-  border: 1px solid #29283b;
-  border-radius: 14px;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-}
-
-.clip-video-box {
-  position: relative;
-  aspect-ratio: 16 / 9;
-  background: #0a0a12;
-  cursor: pointer;
-  overflow: hidden;
-}
-
-.clip-video-box video {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.play-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.25);
-  color: #fff;
-}
-
-.clip-badges {
-  position: absolute;
-  top: 8px;
-  left: 8px;
-  display: flex;
-  gap: 6px;
-}
-
-.clip-badges span {
-  font-size: 11px;
-  font-weight: 600;
-  padding: 3px 7px;
-  border-radius: 6px;
-  background: rgba(12, 12, 22, 0.85);
-}
-
-.clip-badges span.cc {
-  background: #802fff;
-}
-
-.clip-body {
-  padding: 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.clip-body h4 {
-  margin: 0;
-  font-size: 14px;
-  line-height: 1.4;
-}
-
-.clip-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: auto;
-}
-
-.templates-grid,
-.settings-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 18px;
-}
-
-.template-card {
-  cursor: pointer;
-  transition: 0.16s;
-}
-
-.template-card p {
-  color: #a6a3bd;
-  font-size: 13.5px;
-  line-height: 1.5;
-}
-
-.template-card.selected {
-  border-color: #8f4dff;
-  background: #1b1630;
-}
-
-.kv-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin-top: 16px;
-}
-
-.kv-list div {
-  display: flex;
-  justify-content: space-between;
-  padding-bottom: 10px;
-  border-bottom: 1px solid #242336;
-  font-size: 14px;
-}
-
-.kv-list span {
-  color: #9e9cb5;
-}
-
-.ok-text {
-  color: #86efac;
-}
-
-.err-text {
-  color: #fca5a5;
-}
-
-.admin-nav-btn {
-  border: 1px solid rgba(166, 106, 255, 0.28) !important;
-}
-
-.admin-stats-3 {
-  grid-template-columns: repeat(3, 1fr);
-}
-
-.mb-16 {
-  margin-bottom: 16px;
-}
-
-.mb-20 {
-  margin-bottom: 20px;
-}
-
-.admin-search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: #10101c;
-  border: 1px solid #2e2c45;
-  border-radius: 9px;
-  padding: 0 11px;
-  color: #9693ae;
-}
-
-.admin-search input {
-  background: transparent;
-  border: 0;
-  outline: 0;
-  color: #fff;
-  padding: 8px 0;
-  font-size: 13px;
-  min-width: 210px;
-}
-
-.table-wrap {
-  overflow-x: auto;
-}
-
-.users-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13.5px;
-}
-
-.users-table th,
-.users-table td {
-  text-align: left;
-  padding: 12px 10px;
-  border-bottom: 1px solid #242336;
-  white-space: nowrap;
-}
-
-.users-table th {
-  font-size: 11.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: #9693ae;
-}
-
-.admin-pill {
-  margin-left: 6px;
-  font-size: 10px;
-  padding: 2px 6px;
-  border-radius: 5px;
-  background: #802fff;
-  color: #fff;
-  vertical-align: middle;
-}
-
-/* ==================== MODAL ==================== */
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(5, 5, 12, 0.82);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-  z-index: 50;
-}
-
-.modal-card {
-  width: 100%;
-  max-width: 780px;
-  background: #141422;
-  border: 1px solid #312f48;
-  border-radius: 16px;
-  padding: 18px;
-}
-
-.modal-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.modal-head h4 {
-  margin: 0 0 4px;
-  font-size: 16px;
-}
-
-.modal-head span {
-  font-size: 12.5px;
-  color: #9e9cb5;
-}
-
-.modal-video {
-  width: 100%;
-  max-height: 62vh;
-  border-radius: 10px;
-  background: #000;
-}
-
-.modal-foot {
-  margin-top: 14px;
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-/* ==================== RESPONSIVE ==================== */
-@media (max-width: 1020px) {
-  .stats {
-    grid-template-columns: repeat(2, 1fr);
+  async function parseResponse(res) {
+    const text = await res.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = {};
+    }
+    if (!res.ok) {
+      if (data.detail) throw new Error(data.detail);
+      if (res.status === 404) {
+        throw new Error(
+          "Backend route not found (404). Make sure frontend/vite.config.js has the /api proxy and restart npm run dev."
+        );
+      }
+      if (res.status >= 500) {
+        throw new Error(
+          "Backend server not reachable (500). Make sure uvicorn is running in Backend on port 8000."
+        );
+      }
+      throw new Error(`Request failed (HTTP ${res.status}).`);
+    }
+    return data;
   }
-  .content {
-    grid-template-columns: 1fr;
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    setInfo("");
+    setLoading(true);
+    try {
+      if (mode === "forgot") {
+        if (resetStep === 1) {
+          const res = await fetch(`${API_BASE}/auth/forgot-password`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email }),
+          });
+          const data = await parseResponse(res);
+          setResetStep(2);
+          setInfo(data.message);
+        } else {
+          const res = await fetch(`${API_BASE}/auth/reset-password`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              email,
+              code: resetCode,
+              new_password: newPassword,
+            }),
+          });
+          const data = await parseResponse(res);
+          setMode("login");
+          setPassword("");
+          setResetStep(1);
+          setInfo(data.message);
+        }
+        return;
+      }
+
+      const endpoint = mode === "register" ? "/auth/register" : "/auth/login";
+      const payload =
+        mode === "register" ? { name, email, password } : { email, password };
+
+      const res = await fetch(`${API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await parseResponse(res);
+      localStorage.setItem("viralcut_token", data.token);
+      onAuthSuccess(data.user, data.token);
+    } catch (err) {
+      setError(err.message || "Could not reach backend server.");
+    } finally {
+      setLoading(false);
+    }
   }
+
+  return (
+    <div className="auth-shell">
+      <div className="auth-glow" />
+      <div className="auth-card">
+        <div className="auth-brand">
+          <div className="brand-badge">
+            <Scissors size={20} />
+          </div>
+          <div>
+            <h2>
+              ViralCut <span>AI</span>
+            </h2>
+            <p>AI Video Clipping Workspace</p>
+          </div>
+        </div>
+
+        {mode !== "forgot" ? (
+          <div className="auth-tabs">
+            <button
+              type="button"
+              className={mode === "login" ? "active" : ""}
+              onClick={() => switchMode("login")}
+            >
+              Log In
+            </button>
+            <button
+              type="button"
+              className={mode === "register" ? "active" : ""}
+              onClick={() => switchMode("register")}
+            >
+              Create Account
+            </button>
+          </div>
+        ) : (
+          <div className="forgot-header">
+            <button
+              type="button"
+              className="link-btn back-link"
+              onClick={() => switchMode("login")}
+            >
+              <ArrowLeft size={14} /> Back to Log In
+            </button>
+            <h3>Reset Your Password</h3>
+            <p>
+              {resetStep === 1
+                ? "Enter your registered email — we'll send a 6-digit verification code to your Gmail inbox."
+                : "Check your Gmail inbox, enter the 6-digit code below, and set your new password."}
+            </p>
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} className="auth-form">
+          {mode === "register" && (
+            <label className="field">
+              <span>Full Name</span>
+              <div className="field-input">
+                <User size={16} />
+                <input
+                  type="text"
+                  required
+                  placeholder="Rahul Patil"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
+              </div>
+            </label>
+          )}
+
+          <label className="field">
+            <span>Email Address</span>
+            <div className="field-input">
+              <Mail size={16} />
+              <input
+                type="email"
+                required
+                placeholder="you@example.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={mode === "forgot" && resetStep === 2}
+              />
+            </div>
+          </label>
+
+          {mode !== "forgot" && (
+            <label className="field">
+              <div className="field-label-row">
+                <span>Password</span>
+                {mode === "login" && (
+                  <button
+                    type="button"
+                    className="link-btn small-link"
+                    onClick={() => switchMode("forgot")}
+                  >
+                    Forgot password?
+                  </button>
+                )}
+              </div>
+              <div className="field-input">
+                <Lock size={16} />
+                <input
+                  type={showPassword ? "text" : "password"}
+                  required
+                  minLength={6}
+                  placeholder="At least 6 characters"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="eye-btn"
+                  onClick={() => setShowPassword((v) => !v)}
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                  title={showPassword ? "Hide password" : "Show password"}
+                >
+                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+            </label>
+          )}
+
+          {mode === "forgot" && resetStep === 2 && (
+            <>
+              <label className="field">
+                <span>6-Digit Code from Gmail</span>
+                <div className="field-input">
+                  <KeyRound size={16} />
+                  <input
+                    type="text"
+                    required
+                    maxLength={6}
+                    placeholder="Enter 6-digit code from your email"
+                    value={resetCode}
+                    onChange={(e) => setResetCode(e.target.value)}
+                  />
+                </div>
+              </label>
+
+              <label className="field">
+                <span>New Password</span>
+                <div className="field-input">
+                  <Lock size={16} />
+                  <input
+                    type={showPassword ? "text" : "password"}
+                    required
+                    minLength={6}
+                    placeholder="Enter new password (6+ chars)"
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="eye-btn"
+                    onClick={() => setShowPassword((v) => !v)}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                    title={showPassword ? "Hide password" : "Show password"}
+                  >
+                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </label>
+            </>
+          )}
+
+          {info && (
+            <div className="alert success">
+              <CheckCircle2 size={16} />
+              <span>{info}</span>
+            </div>
+          )}
+
+          {error && (
+            <div className="alert error">
+              <AlertCircle size={16} />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <button type="submit" className="primary-btn full" disabled={loading}>
+            {loading ? (
+              <>
+                <Loader2 size={17} className="spin" />
+                {mode === "register"
+                  ? "Creating account..."
+                  : mode === "forgot"
+                  ? resetStep === 1
+                    ? "Generating code..."
+                    : "Updating password..."
+                  : "Signing in..."}
+              </>
+            ) : (
+              <>
+                {mode === "forgot" ? <KeyRound size={17} /> : <Sparkles size={17} />}
+                {mode === "register"
+                  ? "Create Free Account"
+                  : mode === "forgot"
+                  ? resetStep === 1
+                    ? "Send Reset Code"
+                    : "Reset Password"
+                  : "Sign In to Workspace"}
+              </>
+            )}
+          </button>
+        </form>
+
+        {mode !== "forgot" && (
+          <div className="auth-footer">
+            {mode === "login" ? (
+              <p>
+                New to ViralCut AI?{" "}
+                <button
+                  type="button"
+                  className="link-btn"
+                  onClick={() => switchMode("register")}
+                >
+                  Register here
+                </button>
+              </p>
+            ) : (
+              <p>
+                Already have an account?{" "}
+                <button
+                  type="button"
+                  className="link-btn"
+                  onClick={() => switchMode("login")}
+                >
+                  Log in
+                </button>
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
-@media (max-width: 720px) {
-  .sidebar {
-    display: none;
+export default function App() {
+  const [token, setToken] = useState(() => localStorage.getItem("viralcut_token") || "");
+  const [user, setUser] = useState(null);
+  const [authChecking, setAuthChecking] = useState(Boolean(localStorage.getItem("viralcut_token")));
+
+  const [activeTab, setActiveTab] = useState("dashboard");
+  const [url, setUrl] = useState("");
+  const [clipLength, setClipLength] = useState(30); // 30 | 45 | 60
+  const [maxClips, setMaxClips] = useState(5);      // 5 | 10 | 20
+  const [burnCaptions, setBurnCaptions] = useState(true);
+  const [captionTheme, setCaptionTheme] = useState("gold");
+  const [selectedTemplate, setSelectedTemplate] = useState("Premium Gold CC");
+  const [copiedKey, setCopiedKey] = useState("");
+
+  const [stats, setStats] = useState({
+    projects_count: 0,
+    clips_count: 0,
+    top_score: null,
+    time_saved_min: 0,
+  });
+  const [projects, setProjects] = useState([]);
+  const [clips, setClips] = useState([]);
+  const [selectedProjectId, setSelectedProjectId] = useState(null);
+
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState("");
+  const [analyzeSuccess, setAnalyzeSuccess] = useState("");
+
+  const [cuttingKey, setCuttingKey] = useState(null);
+  const [clipStatus, setClipStatus] = useState({ type: "", text: "" });
+  const [previewClip, setPreviewClip] = useState(null);
+  const [health, setHealth] = useState(null);
+
+  const [adminData, setAdminData] = useState(null);
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [adminSearch, setAdminSearch] = useState("");
+  const [adminNotice, setAdminNotice] = useState("");
+
+  async function apiFetch(path, options = {}, overrideToken = null) {
+    const activeToken = overrideToken ?? token;
+    const headers = {
+      ...(options.headers || {}),
+      ...(activeToken ? { Authorization: `Bearer ${activeToken}` } : {}),
+    };
+    const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) {
+      handleLogout();
+      throw new Error(data.detail || "Session expired. Please log in again.");
+    }
+    if (!res.ok) {
+      throw new Error(data.detail || "Request failed.");
+    }
+    return data;
   }
-  main {
-    padding: 20px 15px;
+
+  async function loadWorkspace(tok = token) {
+    if (!tok) return;
+    try {
+      const data = await apiFetch("/workspace", {}, tok);
+      setStats(data.stats);
+      setProjects(data.projects);
+      setClips(data.clips);
+      if (data.projects.length > 0 && !selectedProjectId) {
+        setSelectedProjectId(data.projects[0].id);
+      }
+    } catch (err) {
+      console.error(err);
+    }
   }
-  .url-box {
-    flex-wrap: wrap;
-    padding: 10px;
+
+  async function loadHealth() {
+    try {
+      const res = await fetch(`${API_BASE}/health`);
+      if (res.ok) {
+        setHealth(await res.json());
+      }
+    } catch {
+      setHealth({ status: "offline" });
+    }
   }
-  .url-box button {
-    width: 100%;
+
+  async function loadAdminUsers() {
+    setAdminLoading(true);
+    setAdminNotice("");
+    try {
+      const data = await apiFetch("/admin/users");
+      setAdminData(data);
+    } catch (err) {
+      setAdminNotice(err.message);
+    } finally {
+      setAdminLoading(false);
+    }
   }
+
+  useEffect(() => {
+    loadHealth();
+    if (!token) {
+      setAuthChecking(false);
+      return;
+    }
+    (async () => {
+      try {
+        const res = await apiFetch("/auth/me", {}, token);
+        setUser(res.user);
+        await loadWorkspace(token);
+      } catch {
+        // handled by apiFetch
+      } finally {
+        setAuthChecking(false);
+      }
+    })();
+  }, []);
+
+  function handleAuthSuccess(loggedUser, newToken) {
+    setUser(loggedUser);
+    setToken(newToken);
+    setSelectedProjectId(null);
+    loadWorkspace(newToken);
+  }
+
+  function handleLogout() {
+    localStorage.removeItem("viralcut_token");
+    setToken("");
+    setUser(null);
+    setProjects([]);
+    setClips([]);
+    setSelectedProjectId(null);
+    setStats({ projects_count: 0, clips_count: 0, top_score: null, time_saved_min: 0 });
+  }
+
+  function handleCopyText(text, key) {
+    navigator.clipboard?.writeText(text || "");
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey((cur) => (cur === key ? "" : cur)), 1800);
+  }
+
+  async function handleAnalyze(e) {
+    if (e) e.preventDefault();
+    if (!url.trim()) {
+      setAnalyzeError("Please paste a YouTube video URL first.");
+      return;
+    }
+    setAnalyzing(true);
+    setAnalyzeError("");
+    setAnalyzeSuccess("");
+    setClipStatus({ type: "", text: "" });
+    try {
+      const data = await apiFetch("/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: url.trim(),
+          clip_length: clipLength,
+          max_clips: maxClips,
+        }),
+      });
+      const proj = data.project;
+      setSelectedProjectId(proj.id);
+      setAnalyzeSuccess(
+        `Generated ${proj.suggestions.length} viral ${proj.clip_length}s clip ideas (with Title, Description & Hashtags) for "${proj.title}".`
+      );
+      setUrl("");
+      await loadWorkspace();
+      setActiveTab("dashboard");
+    } catch (err) {
+      setAnalyzeError(err.message);
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  async function handleUploadVideo(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setAnalyzing(true);
+    setAnalyzeError("");
+    setAnalyzeSuccess("");
+    setClipStatus({ type: "", text: "" });
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("clip_length", String(clipLength));
+      form.append("max_clips", String(maxClips));
+      const data = await apiFetch("/upload", {
+        method: "POST",
+        body: form,
+      });
+      const proj = data.project;
+      setSelectedProjectId(proj.id);
+      setAnalyzeSuccess(
+        `Uploaded "${proj.title}" and found ${proj.suggestions.length} high-energy ${proj.clip_length}s clips! Click "Cut & Download" on any clip below.`
+      );
+      await loadWorkspace();
+      setActiveTab("dashboard");
+    } catch (err) {
+      setAnalyzeError(err.message);
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  async function handleCreateDemo() {
+    setAnalyzing(true);
+    setAnalyzeError("");
+    setAnalyzeSuccess("");
+    setClipStatus({ type: "", text: "" });
+    try {
+      const data = await apiFetch("/demo", { method: "POST" });
+      const proj = data.project;
+      setSelectedProjectId(proj.id);
+      setAnalyzeSuccess(
+        `Demo video ready with ${proj.suggestions.length} AI suggestions! Click "Cut & Download" below to test real clipping + synced captions.`
+      );
+      await loadWorkspace();
+      setActiveTab("dashboard");
+    } catch (err) {
+      setAnalyzeError(err.message);
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  async function handleCutClip(project, suggestion) {
+    const key = `${project.id}_${suggestion.start}_${suggestion.end}`;
+    setCuttingKey(key);
+    setClipStatus({
+      type: "info",
+      text: "Cutting 1080p clip" + (burnCaptions ? " & burning synced captions" : "") + "... this can take 15–45 seconds.",
+    });
+
+    try {
+      const data = await apiFetch("/clips/cut", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: project.id,
+          start: suggestion.start,
+          end: suggestion.end,
+          title: suggestion.title,
+          description: suggestion.description || "",
+          hashtags: suggestion.hashtags || [],
+          score: suggestion.score,
+          captions: burnCaptions,
+          caption_theme: captionTheme,
+        }),
+      });
+
+      await loadWorkspace();
+
+      setClipStatus({
+        type: data.note ? "warn" : "success",
+        text: data.note
+          ? `${data.note} Saved to My Clips.`
+          : `Clip saved to My Clips (${data.clip.quality}${data.clip.has_captions ? " + CC" : ""})! Downloading now...`,
+      });
+
+      // Trigger browser file download
+      const a = document.createElement("a");
+      a.href = data.clip.download_url;
+      a.download = data.clip.filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (err) {
+      setClipStatus({ type: "error", text: err.message });
+    } finally {
+      setCuttingKey(null);
+    }
+  }
+
+  async function handleDeleteClip(clipId) {
+    try {
+      await apiFetch(`/clips/${clipId}`, { method: "DELETE" });
+      if (previewClip?.id === clipId) setPreviewClip(null);
+      await loadWorkspace();
+    } catch (err) {
+      setClipStatus({ type: "error", text: err.message });
+    }
+  }
+
+  async function handleDeleteProject(projectId) {
+    try {
+      await apiFetch(`/projects/${projectId}`, { method: "DELETE" });
+      if (selectedProjectId === projectId) {
+        const remaining = projects.filter((p) => p.id !== projectId);
+        setSelectedProjectId(remaining[0]?.id ?? null);
+      }
+      await loadWorkspace();
+    } catch (err) {
+      setAnalyzeError(err.message);
+    }
+  }
+
+  if (authChecking) {
+    return (
+      <div className="auth-shell">
+        <div className="loading-pill">
+          <Loader2 size={20} className="spin" /> Loading ViralCut AI...
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <AuthScreen onAuthSuccess={handleAuthSuccess} />;
+  }
+
+  const activeProject =
+    projects.find((p) => p.id === selectedProjectId) || projects[0] || null;
+
+  const isClipped = (projectId, start, end) =>
+    clips.some(
+      (c) =>
+        c.project_id === projectId &&
+        Math.abs(c.start - start) < 1 &&
+        Math.abs(c.end - end) < 1
+    );
+
+  const initials = (user.name || "VC")
+    .split(" ")
+    .map((w) => w[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+
+  return (
+    <div className="app">
+      <aside className="sidebar">
+        <div className="logo-row">
+          <Scissors size={22} className="accent-icon" />
+          <h2>
+            ViralCut <span>AI</span>
+          </h2>
+        </div>
+
+        <nav>
+          <button
+            className={activeTab === "dashboard" ? "active" : ""}
+            onClick={() => setActiveTab("dashboard")}
+          >
+            <Home size={18} /> Dashboard
+          </button>
+          <button
+            className={activeTab === "new" ? "active" : ""}
+            onClick={() => setActiveTab("new")}
+          >
+            <Plus size={18} /> New Project
+          </button>
+          <button
+            className={activeTab === "clips" ? "active" : ""}
+            onClick={() => setActiveTab("clips")}
+          >
+            <FolderOpen size={18} /> My Clips
+            <span className="nav-badge">{clips.length}</span>
+          </button>
+          <button
+            className={activeTab === "templates" ? "active" : ""}
+            onClick={() => setActiveTab("templates")}
+          >
+            <Film size={18} /> Templates
+          </button>
+          {user.is_admin && (
+            <button
+              className={`admin-nav-btn ${activeTab === "admin" ? "active" : ""}`}
+              onClick={() => {
+                setActiveTab("admin");
+                loadAdminUsers();
+              }}
+            >
+              <Users size={18} /> Registered Users
+              <span className="nav-badge">Admin</span>
+            </button>
+          )}
+          <button
+            className={activeTab === "settings" ? "active" : ""}
+            onClick={() => {
+              setActiveTab("settings");
+              loadHealth();
+            }}
+          >
+            <Settings size={18} /> Settings
+          </button>
+        </nav>
+
+        <div className="side-bottom">
+          <div className="user-mini">
+            <div className="avatar">{initials}</div>
+            <div className="user-meta">
+              <strong>{user.name}</strong>
+              <span>{user.email}</span>
+            </div>
+          </div>
+          <button className="logout-btn" onClick={handleLogout}>
+            <LogOut size={15} /> Log Out
+          </button>
+        </div>
+      </aside>
+
+      <main>
+        <header>
+          <div className="header-left">
+            <span className="workspace-label">AI VIDEO WORKSPACE</span>
+            {health?.ffmpeg_ready && (
+              <span className="status-pill ok">
+                <CheckCircle2 size={13} /> {health.max_height}p · {health.font}
+              </span>
+            )}
+          </div>
+          <div className="header-right">
+            {burnCaptions && (
+              <div className="theme-picker" title="Premium caption highlight color">
+                {[
+                  { id: "gold", label: "Gold", dot: "#FFD726" },
+                  { id: "violet", label: "Violet", dot: "#B885FF" },
+                  { id: "mint", label: "Mint", dot: "#4AEF86" },
+                ].map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className={captionTheme === t.id ? "active" : ""}
+                    onClick={() => {
+                      setCaptionTheme(t.id);
+                      setSelectedTemplate(`Premium ${t.label} CC`);
+                    }}
+                  >
+                    <span className="color-dot" style={{ background: t.dot }} />
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            )}
+            <button
+              className={`caption-toggle ${burnCaptions ? "on" : ""}`}
+              onClick={() => setBurnCaptions((v) => !v)}
+              title="Toggle burned-in captions on exported clips"
+            >
+              <Subtitles size={15} />
+              Captions: {burnCaptions ? "ON" : "OFF"}
+            </button>
+            <button className="profile-chip" onClick={() => setActiveTab("settings")}>
+              <span className="mini-dot">{initials}</span>
+              {user.name}
+            </button>
+          </div>
+        </header>
+
+        {/* ===================== DASHBOARD & NEW PROJECT ===================== */}
+        {(activeTab === "dashboard" || activeTab === "new") && (
+          <>
+            <section className="hero">
+              <div className="tag">
+                <Sparkles size={15} /> AI POWERED VIDEO CLIPPING · {selectedTemplate.toUpperCase()}
+              </div>
+              <h1>
+                Turn long videos into
+                <br />
+                <span>viral moments.</span>
+              </h1>
+              <p>
+                Paste a YouTube link to discover high-scoring moments — then click{" "}
+                <strong>Cut &amp; Download</strong> only on the clips you actually want.
+              </p>
+
+              <form className="url-box" onSubmit={handleAnalyze}>
+                <LinkIcon size={18} className="url-icon" />
+                <input
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  placeholder="Paste YouTube URL (e.g. https://www.youtube.com/watch?v=...)"
+                  disabled={analyzing}
+                />
+                <button type="submit" className="primary-btn" disabled={analyzing}>
+                  {analyzing ? (
+                    <>
+                      <Loader2 size={17} className="spin" /> Analyzing...
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles size={17} /> Generate {maxClips} Clips ({clipLength}s)
+                    </>
+                  )}
+                </button>
+              </form>
+
+              <div className="clip-options-bar">
+                <div className="option-group">
+                  <span className="opt-label">
+                    <Timer size={14} /> Clip Duration:
+                  </span>
+                  <div className="pill-group">
+                    {[30, 45, 60].map((sec) => (
+                      <button
+                        key={sec}
+                        type="button"
+                        className={clipLength === sec ? "active" : ""}
+                        onClick={() => setClipLength(sec)}
+                        disabled={analyzing}
+                      >
+                        {sec}s
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="option-group">
+                  <span className="opt-label">
+                    <Layers size={14} /> Number of Clips:
+                  </span>
+                  <div className="pill-group">
+                    {[5, 10, 20].map((cnt) => (
+                      <button
+                        key={cnt}
+                        type="button"
+                        className={maxClips === cnt ? "active" : ""}
+                        onClick={() => setMaxClips(cnt)}
+                        disabled={analyzing}
+                      >
+                        {cnt} Clips
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="hero-subrow">
+                <small>
+                  Auto-generates Viral Title, Description &amp; Hashtags for every clip · 1080p smooth export
+                </small>
+                <div className="hero-quick-btns">
+                  <label className={`ghost-btn upload-label ${analyzing ? "disabled" : ""}`}>
+                    <Upload size={14} /> Upload Video (MP4)
+                    <input
+                      type="file"
+                      accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv"
+                      onChange={handleUploadVideo}
+                      disabled={analyzing}
+                      hidden
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={handleCreateDemo}
+                    disabled={analyzing}
+                  >
+                    <Play size={14} /> Try Instant Demo Video
+                  </button>
+                </div>
+              </div>
+
+              {analyzeError && (
+                <div className="alert error mt-12">
+                  <AlertCircle size={16} />
+                  <span>{analyzeError}</span>
+                </div>
+              )}
+              {analyzeSuccess && (
+                <div className="alert success mt-12">
+                  <CheckCircle2 size={16} />
+                  <span>{analyzeSuccess}</span>
+                </div>
+              )}
+            </section>
+
+            {activeTab === "dashboard" && (
+              <>
+                <section className="stats">
+                  <div className="stat-card">
+                    <Film size={20} />
+                    <span>Analyzed Projects</span>
+                    <h2>{stats.projects_count}</h2>
+                  </div>
+                  <div className="stat-card" onClick={() => setActiveTab("clips")} style={{ cursor: "pointer" }}>
+                    <Scissors size={20} />
+                    <span>My Clipped Videos</span>
+                    <h2>{stats.clips_count}</h2>
+                  </div>
+                  <div className="stat-card">
+                    <TrendingUp size={20} />
+                    <span>Top Clip Score</span>
+                    <h2>{stats.top_score ?? "--"}</h2>
+                  </div>
+                  <div className="stat-card">
+                    <Clock size={20} />
+                    <span>Time Saved</span>
+                    <h2>{stats.time_saved_min} min</h2>
+                  </div>
+                </section>
+
+                <section className="content">
+                  {/* LEFT PANEL: RECENT PROJECTS */}
+                  <div className="panel">
+                    <div className="panel-head">
+                      <h3>
+                        <Film size={18} /> Recent Projects
+                      </h3>
+                      <span className="muted-pill">{projects.length} total</span>
+                    </div>
+
+                    {projects.length === 0 ? (
+                      <div className="empty">
+                        <Film size={40} />
+                        <h3>No projects yet</h3>
+                        <p>
+                          Paste a YouTube URL above or click <strong>Try Instant Demo Video</strong>{" "}
+                          to analyze your first video.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="project-list">
+                        {projects.map((proj) => {
+                          const isSelected = activeProject?.id === proj.id;
+                          const clippedCount = clips.filter(
+                            (c) => c.project_id === proj.id
+                          ).length;
+                          return (
+                            <div
+                              key={proj.id}
+                              className={`project-card ${isSelected ? "selected" : ""}`}
+                              onClick={() => setSelectedProjectId(proj.id)}
+                            >
+                              <div className="project-thumb">
+                                {proj.thumbnail ? (
+                                  <img src={proj.thumbnail} alt={proj.title} />
+                                ) : (
+                                  <div className="thumb-fallback">
+                                    <Film size={22} />
+                                  </div>
+                                )}
+                                <span className="dur-badge">{formatTime(proj.duration)}</span>
+                              </div>
+                              <div className="project-info">
+                                <h4>{proj.title}</h4>
+                                <div className="project-meta">
+                                  <span>{proj.suggestions.length} AI suggestions</span>
+                                  <span>·</span>
+                                  <span className="accent-text">
+                                    {clippedCount} clipped by you
+                                  </span>
+                                  <span>·</span>
+                                  <span>Lang: {proj.language}</span>
+                                </div>
+                              </div>
+                              <button
+                                className="icon-btn danger"
+                                title="Remove project"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteProject(proj.id);
+                                }}
+                              >
+                                <Trash2 size={15} />
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* RIGHT PANEL: AI CLIP INTELLIGENCE (SUGGESTIONS ONLY UNTIL YOU CLICK CUT) */}
+                  <div className="panel">
+                    <div className="panel-head">
+                      <h3>
+                        <Zap size={18} /> AI Clip Intelligence
+                      </h3>
+                      {activeProject && (
+                        <span className="muted-pill">AI Suggestions</span>
+                      )}
+                    </div>
+
+                    {!activeProject ? (
+                      <div className="empty">
+                        <Sparkles size={38} />
+                        <h3>Ready to analyze</h3>
+                        <p>
+                          AI moment suggestions appear here after you analyze a video. Nothing is
+                          clipped until you click Cut &amp; Download.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="intel-wrap">
+                        <div className="intel-summary">
+                          <ScoreRing score={activeProject.top_score} />
+                          <div>
+                            <span className="mini-tag">SELECTED PROJECT</span>
+                            <h4>{activeProject.title}</h4>
+                            <p>
+                              Showing <strong>AI-suggested moments</strong> below. Only moments
+                              you click <strong>Cut &amp; Download</strong> on are saved to{" "}
+                              <strong>My Clips</strong>.
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="suggestions-list">
+                          {activeProject.suggestions.map((sug, idx) => {
+                            const key = `${activeProject.id}_${sug.start}_${sug.end}`;
+                            const isCutting = cuttingKey === key;
+                            const alreadyClipped = isClipped(
+                              activeProject.id,
+                              sug.start,
+                              sug.end
+                            );
+                            const ytLink =
+                              activeProject.video_id !== "demo_viralcut" &&
+                              !String(activeProject.url || "").startsWith("upload://")
+                                ? `https://www.youtube.com/watch?v=${activeProject.video_id}&t=${Math.floor(
+                                    sug.start
+                                  )}s`
+                                : null;
+
+                            const tagsText = (sug.hashtags || []).join(" ");
+                            const fullCopy = `${sug.title}\n\n${sug.description || ""}\n\n${tagsText}`.trim();
+
+                            return (
+                              <div key={key} className="suggestion-card">
+                                <div className="sug-top">
+                                  <span className="rank-badge">#{idx + 1}</span>
+                                  <span className="time-pill">
+                                    {formatTime(sug.start)} – {formatTime(sug.end)} ({sug.duration}s)
+                                  </span>
+                                  <span className="score-pill">Score {sug.score}</span>
+                                  {alreadyClipped && (
+                                    <span className="clipped-pill">
+                                      <CheckCircle2 size={12} /> Clipped
+                                    </span>
+                                  )}
+                                </div>
+
+                                <div className="meta-block">
+                                  <div className="meta-row">
+                                    <span className="meta-label">TITLE</span>
+                                    <button
+                                      type="button"
+                                      className="copy-mini"
+                                      onClick={() => handleCopyText(sug.title, `${key}_t`)}
+                                    >
+                                      {copiedKey === `${key}_t` ? <Check size={12} /> : <Copy size={12} />}
+                                      {copiedKey === `${key}_t` ? "Copied" : "Copy"}
+                                    </button>
+                                  </div>
+                                  <h5>{sug.title}</h5>
+
+                                  {sug.description && (
+                                    <>
+                                      <div className="meta-row mt-8">
+                                        <span className="meta-label">DESCRIPTION</span>
+                                        <button
+                                          type="button"
+                                          className="copy-mini"
+                                          onClick={() => handleCopyText(sug.description, `${key}_d`)}
+                                        >
+                                          {copiedKey === `${key}_d` ? <Check size={12} /> : <Copy size={12} />}
+                                          {copiedKey === `${key}_d` ? "Copied" : "Copy"}
+                                        </button>
+                                      </div>
+                                      <p className="clip-desc">{sug.description}</p>
+                                    </>
+                                  )}
+
+                                  {sug.hashtags && sug.hashtags.length > 0 && (
+                                    <>
+                                      <div className="meta-row mt-8">
+                                        <span className="meta-label">
+                                          <Hash size={11} /> HASHTAGS
+                                        </span>
+                                        <button
+                                          type="button"
+                                          className="copy-mini"
+                                          onClick={() => handleCopyText(tagsText, `${key}_h`)}
+                                        >
+                                          {copiedKey === `${key}_h` ? <Check size={12} /> : <Copy size={12} />}
+                                          {copiedKey === `${key}_h` ? "Copied" : "Copy Tags"}
+                                        </button>
+                                      </div>
+                                      <div className="hashtag-list">
+                                        {sug.hashtags.map((tag) => (
+                                          <span key={tag} className="hashtag-chip">
+                                            {tag}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    </>
+                                  )}
+                                </div>
+
+                                <p className="sug-reason">{sug.reason}</p>
+                                <div className="sug-actions">
+                                  <button
+                                    className="cut-btn"
+                                    disabled={Boolean(cuttingKey)}
+                                    onClick={() => handleCutClip(activeProject, sug)}
+                                  >
+                                    {isCutting ? (
+                                      <>
+                                        <Loader2 size={14} className="spin" /> Cutting...
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Download size={14} /> Cut &amp; Download{" "}
+                                        {burnCaptions ? "(CC)" : ""}
+                                      </>
+                                    )}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="ghost-btn small"
+                                    onClick={() => handleCopyText(fullCopy, `${key}_all`)}
+                                  >
+                                    {copiedKey === `${key}_all` ? <Check size={13} /> : <Copy size={13} />}
+                                    {copiedKey === `${key}_all` ? "Copied All!" : "Copy All Meta"}
+                                  </button>
+                                  {ytLink && (
+                                    <a
+                                      href={ytLink}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="ghost-btn small"
+                                    >
+                                      <ExternalLink size={13} /> Preview on YT
+                                    </a>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {clipStatus.text && (
+                          <div className={`alert ${clipStatus.type} mt-12`}>
+                            {clipStatus.type === "info" ? (
+                              <Loader2 size={16} className="spin" />
+                            ) : clipStatus.type === "success" ? (
+                              <CheckCircle2 size={16} />
+                            ) : (
+                              <AlertCircle size={16} />
+                            )}
+                            <span>{clipStatus.text}</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </section>
+              </>
+            )}
+          </>
+        )}
+
+        {/* ===================== MY CLIPS (ONLY CLIPS YOU ACTUALLY CUT) ===================== */}
+        {activeTab === "clips" && (
+          <section className="page-section">
+            <div className="section-header">
+              <div>
+                <h1>My Clipped Videos</h1>
+                <p>
+                  Only real clips that you actually cut and saved appear here — never unclipped
+                  suggestions.
+                </p>
+              </div>
+              <button className="primary-btn" onClick={() => setActiveTab("dashboard")}>
+                <Plus size={16} /> Cut More Clips
+              </button>
+            </div>
+
+            {clips.length === 0 ? (
+              <div className="panel empty large">
+                <Scissors size={44} />
+                <h3>You haven&apos;t clipped any videos yet</h3>
+                <p>
+                  Analyze a video on the Dashboard, then click <strong>Cut &amp; Download</strong>{" "}
+                  on any moment you want to save here.
+                </p>
+                <button
+                  className="primary-btn mt-12"
+                  onClick={() => setActiveTab("dashboard")}
+                >
+                  Go to Dashboard
+                </button>
+              </div>
+            ) : (
+              <div className="clips-grid">
+                {clips.map((clip) => (
+                  <div key={clip.id} className="clip-card">
+                    <div className="clip-video-box" onClick={() => setPreviewClip(clip)}>
+                      <video src={clip.video_url} muted preload="metadata" />
+                      <div className="play-overlay">
+                        <Play size={22} />
+                      </div>
+                      <div className="clip-badges">
+                        <span>{clip.quality}</span>
+                        {clip.has_captions && <span className="cc">CC</span>}
+                        <span>{clip.duration}s</span>
+                      </div>
+                    </div>
+                    <div className="clip-body">
+                      <div className="sug-top">
+                        <span className="time-pill">
+                          {formatTime(clip.start)} – {formatTime(clip.end)}
+                        </span>
+                        <span className="score-pill">Score {clip.score}</span>
+                      </div>
+                      <h4>{clip.title}</h4>
+                      {clip.description && (
+                        <p className="clip-desc clamp">{clip.description}</p>
+                      )}
+                      {clip.hashtags && clip.hashtags.length > 0 && (
+                        <div className="hashtag-list">
+                          {clip.hashtags.slice(0, 5).map((tag) => (
+                            <span key={tag} className="hashtag-chip">
+                              {tag}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <div className="clip-actions">
+                        <button
+                          className="ghost-btn small"
+                          onClick={() => setPreviewClip(clip)}
+                        >
+                          <Play size={14} /> Watch
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-btn small"
+                          onClick={() =>
+                            handleCopyText(
+                              `${clip.title}\n\n${clip.description || ""}\n\n${(clip.hashtags || []).join(" ")}`.trim(),
+                              `clip_${clip.id}`
+                            )
+                          }
+                        >
+                          {copiedKey === `clip_${clip.id}` ? <Check size={13} /> : <Copy size={13} />}
+                          {copiedKey === `clip_${clip.id}` ? "Copied" : "Copy Info"}
+                        </button>
+                        <a
+                          href={clip.download_url}
+                          download={clip.filename}
+                          className="cut-btn small"
+                        >
+                          <Download size={14} /> Download
+                        </a>
+                        <button
+                          className="icon-btn danger"
+                          title="Delete clip"
+                          onClick={() => handleDeleteClip(clip.id)}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* ===================== TEMPLATES ===================== */}
+        {activeTab === "templates" && (
+          <section className="page-section">
+            <div className="section-header">
+              <div>
+                <h1>Clip Templates</h1>
+                <p>Choose your default caption and export style for newly cut clips.</p>
+              </div>
+            </div>
+            <div className="templates-grid">
+              {[
+                {
+                  name: "Premium Gold CC",
+                  desc: "Compact sleek captions in pearl white + Luxe Gold keyword highlights, smooth 30fps 1080p.",
+                  captions: true,
+                  theme: "gold",
+                },
+                {
+                  name: "Premium Violet CC",
+                  desc: "Compact sleek captions with Electric Violet viral keyword accents & crisp dark outline.",
+                  captions: true,
+                  theme: "violet",
+                },
+                {
+                  name: "Premium Mint CC",
+                  desc: "Fresh Emerald Mint keyword pop with clean modern typography (English & Hindi).",
+                  captions: true,
+                  theme: "mint",
+                },
+                {
+                  name: "Raw Clean 1080p (No CC)",
+                  desc: "Fastest export — smooth 30fps 1080p clip without burned-in captions.",
+                  captions: false,
+                  theme: "gold",
+                },
+              ].map((tpl) => {
+                const active = selectedTemplate === tpl.name;
+                return (
+                  <div
+                    key={tpl.name}
+                    className={`panel template-card ${active ? "selected" : ""}`}
+                    onClick={() => {
+                      setSelectedTemplate(tpl.name);
+                      setBurnCaptions(tpl.captions);
+                      setCaptionTheme(tpl.theme);
+                    }}
+                  >
+                    <div className="panel-head">
+                      <h3>{tpl.name}</h3>
+                      {active && <span className="clipped-pill">Active</span>}
+                    </div>
+                    <p>{tpl.desc}</p>
+                    <span className="muted-pill">
+                      Captions: {tpl.captions ? "Enabled" : "Disabled"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* ===================== REGISTERED USERS (ADMIN PANEL) ===================== */}
+        {activeTab === "admin" && user.is_admin && (
+          <section className="page-section">
+            <div className="section-header">
+              <div>
+                <h1>Registered Users (Admin)</h1>
+                <p>
+                  Every account created on ViralCut AI along with their join date and activity.
+                </p>
+              </div>
+              <button
+                className="ghost-btn"
+                onClick={loadAdminUsers}
+                disabled={adminLoading}
+              >
+                <RefreshCw size={15} className={adminLoading ? "spin" : ""} /> Refresh Users
+              </button>
+            </div>
+
+            {adminNotice && (
+              <div className="alert error mb-16">
+                <AlertCircle size={16} />
+                <span>{adminNotice}</span>
+              </div>
+            )}
+
+            {adminData && (
+              <>
+                <section className="stats admin-stats-3 mb-20">
+                  <div className="stat-card">
+                    <Users size={20} />
+                    <span>Total Registered Users</span>
+                    <h2>{adminData.summary.total_users}</h2>
+                  </div>
+                  <div className="stat-card">
+                    <Film size={20} />
+                    <span>All Projects Analyzed</span>
+                    <h2>{adminData.summary.total_projects}</h2>
+                  </div>
+                  <div className="stat-card">
+                    <Scissors size={20} />
+                    <span>All Clips Created</span>
+                    <h2>{adminData.summary.total_clips}</h2>
+                  </div>
+                </section>
+
+                <div className="panel">
+                  <div className="panel-head">
+                    <h3>
+                      <Users size={18} /> All Registered Accounts ({adminData.users.length})
+                    </h3>
+                    <div className="admin-search">
+                      <Search size={14} />
+                      <input
+                        placeholder="Search by name or email..."
+                        value={adminSearch}
+                        onChange={(e) => setAdminSearch(e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="table-wrap">
+                    <table className="users-table">
+                      <thead>
+                        <tr>
+                          <th>ID</th>
+                          <th>Name</th>
+                          <th>Email</th>
+                          <th>Joined</th>
+                          <th>Projects</th>
+                          <th>Clips Created</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {adminData.users
+                          .filter((u) => {
+                            const q = adminSearch.trim().toLowerCase();
+                            if (!q) return true;
+                            return (
+                              u.name.toLowerCase().includes(q) ||
+                              u.email.toLowerCase().includes(q)
+                            );
+                          })
+                          .map((u) => (
+                            <tr key={u.id}>
+                              <td>#{u.id}</td>
+                              <td>
+                                <strong>
+                                  {u.name}
+                                  {u.is_admin && <span className="admin-pill">ADMIN</span>}
+                                </strong>
+                              </td>
+                              <td>{u.email}</td>
+                              <td>
+                                {new Date(u.created_at).toLocaleString(undefined, {
+                                  year: "numeric",
+                                  month: "short",
+                                  day: "numeric",
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                })}
+                              </td>
+                              <td>{u.projects_count}</td>
+                              <td>{u.clips_count}</td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            )}
+          </section>
+        )}
+
+        {/* ===================== SETTINGS ===================== */}
+        {activeTab === "settings" && (
+          <section className="page-section">
+            <div className="section-header">
+              <div>
+                <h1>Account &amp; Workspace Settings</h1>
+                <p>Manage your ViralCut AI profile and inspect backend engine health.</p>
+              </div>
+            </div>
+            <div className="settings-grid">
+              <div className="panel">
+                <h3>
+                  <User size={18} /> Account Details
+                </h3>
+                <div className="kv-list">
+                  <div>
+                    <span>Name</span>
+                    <strong>{user.name}</strong>
+                  </div>
+                  <div>
+                    <span>Email</span>
+                    <strong>{user.email}</strong>
+                  </div>
+                  <div>
+                    <span>Saved Projects</span>
+                    <strong>{stats.projects_count}</strong>
+                  </div>
+                  <div>
+                    <span>Clipped Videos</span>
+                    <strong>{stats.clips_count}</strong>
+                  </div>
+                </div>
+                <button className="logout-btn mt-16" onClick={handleLogout}>
+                  <LogOut size={15} /> Log Out of ViralCut AI
+                </button>
+              </div>
+
+              <div className="panel">
+                <h3>
+                  <ShieldCheck size={18} /> Backend Engine Status
+                </h3>
+                <div className="kv-list">
+                  <div>
+                    <span>API Server</span>
+                    <strong className={health?.status === "ok" ? "ok-text" : "err-text"}>
+                      {health?.status === "ok" ? "Connected" : "Offline"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>FFmpeg Clipping</span>
+                    <strong className={health?.ffmpeg_ready ? "ok-text" : "err-text"}>
+                      {health?.ffmpeg_ready ? "Ready" : "Unavailable"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>Caption Font</span>
+                    <strong>{health?.font || "--"}</strong>
+                  </div>
+                  <div>
+                    <span>Max Export Quality</span>
+                    <strong>{health?.max_height ? `${health.max_height}p (H.264)` : "--"}</strong>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
+      </main>
+
+      {/* ===================== VIDEO PREVIEW MODAL ===================== */}
+      {previewClip && (
+        <div className="modal-backdrop" onClick={() => setPreviewClip(null)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <div>
+                <h4>{previewClip.title}</h4>
+                <span>
+                  {formatTime(previewClip.start)} – {formatTime(previewClip.end)} ·{" "}
+                  {previewClip.quality} {previewClip.has_captions ? "· Burned CC" : ""}
+                </span>
+              </div>
+              <button className="icon-btn" onClick={() => setPreviewClip(null)}>
+                <X size={18} />
+              </button>
+            </div>
+            <video src={previewClip.video_url} controls autoPlay className="modal-video" />
+            {(previewClip.description || (previewClip.hashtags && previewClip.hashtags.length > 0)) && (
+              <div className="meta-block mt-12">
+                {previewClip.description && (
+                  <p className="clip-desc">{previewClip.description}</p>
+                )}
+                {previewClip.hashtags && previewClip.hashtags.length > 0 && (
+                  <div className="hashtag-list mt-8">
+                    {previewClip.hashtags.map((tag) => (
+                      <span key={tag} className="hashtag-chip">
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            <div className="modal-foot">
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={() =>
+                  handleCopyText(
+                    `${previewClip.title}\n\n${previewClip.description || ""}\n\n${(previewClip.hashtags || []).join(" ")}`.trim(),
+                    `modal_${previewClip.id}`
+                  )
+                }
+              >
+                {copiedKey === `modal_${previewClip.id}` ? <Check size={15} /> : <Copy size={15} />}
+                {copiedKey === `modal_${previewClip.id}` ? "Copied Title, Desc & Tags!" : "Copy Title, Desc & Tags"}
+              </button>
+              <a
+                href={previewClip.download_url}
+                download={previewClip.filename}
+                className="primary-btn"
+              >
+                <Download size={16} /> Download MP4
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
