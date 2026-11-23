@@ -113,11 +113,23 @@ def _normalize_netscape_cookies(raw: str) -> tuple[str, int]:
 
 
 YOUTUBE_COOKIES_COUNT = 0
+YOUTUBE_AUTH_COOKIES_OK = False
+
+
+def _has_youtube_auth_cookies(normalized_text: str) -> bool:
+    auth_names = {"SAPISID", "SID", "__Secure-1PSID", "__Secure-3PSID", "LOGIN_INFO"}
+    for line in normalized_text.splitlines():
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7 and parts[5] in auth_names and parts[6].strip():
+            return True
+    return False
 
 
 def setup_youtube_cookies() -> str | None:
     """Load YouTube cookies from Render Secret File, YOUTUBE_COOKIES_B64, YOUTUBE_COOKIES, or local cookies.txt."""
-    global YOUTUBE_COOKIES_COUNT
+    global YOUTUBE_COOKIES_COUNT, YOUTUBE_AUTH_COOKIES_OK
 
     # 1. Check Render Secret Files (/etc/secrets/cookies.txt) first — zero paste corruption!
     for secret_file in (Path("/etc/secrets/cookies.txt"), BASE_DIR / "cookies.txt"):
@@ -126,7 +138,8 @@ def setup_youtube_cookies() -> str | None:
             norm, cnt = _normalize_netscape_cookies(raw_text)
             COOKIES_PATH.write_text(norm, encoding="utf-8")
             YOUTUBE_COOKIES_COUNT = cnt
-            print(f"COOKIES CHECK: Loaded {cnt} cookies from file {secret_file}")
+            YOUTUBE_AUTH_COOKIES_OK = _has_youtube_auth_cookies(norm)
+            print(f"COOKIES CHECK: Loaded {cnt} cookies (auth={YOUTUBE_AUTH_COOKIES_OK}) from file {secret_file}")
             return str(COOKIES_PATH)
 
     # 2. Check environment variables (YOUTUBE_COOKIES_B64 or YOUTUBE_COOKIES)
@@ -147,7 +160,8 @@ def setup_youtube_cookies() -> str | None:
             norm, cnt = _normalize_netscape_cookies(decoded)
             COOKIES_PATH.write_text(norm, encoding="utf-8")
             YOUTUBE_COOKIES_COUNT = cnt
-            print(f"COOKIES CHECK: Loaded {cnt} cookies from {source_label} ({COOKIES_PATH})")
+            YOUTUBE_AUTH_COOKIES_OK = _has_youtube_auth_cookies(norm)
+            print(f"COOKIES CHECK: Loaded {cnt} cookies (auth={YOUTUBE_AUTH_COOKIES_OK}) from {source_label} ({COOKIES_PATH})")
             return str(COOKIES_PATH)
     except Exception as exc:
         print(f"COOKIES CHECK: Failed reading env cookies -> {exc}")
@@ -156,7 +170,8 @@ def setup_youtube_cookies() -> str | None:
         raw_text = COOKIES_PATH.read_text(encoding="utf-8", errors="ignore")
         norm, cnt = _normalize_netscape_cookies(raw_text)
         YOUTUBE_COOKIES_COUNT = cnt
-        print(f"COOKIES CHECK: Using existing file {COOKIES_PATH} ({cnt} cookies)")
+        YOUTUBE_AUTH_COOKIES_OK = _has_youtube_auth_cookies(norm)
+        print(f"COOKIES CHECK: Using existing file {COOKIES_PATH} ({cnt} cookies, auth={YOUTUBE_AUTH_COOKIES_OK})")
         return str(COOKIES_PATH)
     return None
 
@@ -602,16 +617,16 @@ def _get_transcript_via_innertube(video_id: str) -> tuple[list[dict[str, Any]], 
 def _get_transcript_via_ytdlp(video_id: str, url: str) -> tuple[list[dict[str, Any]], str]:
     """Authenticated yt-dlp subtitle fetcher using yt-dlp's own cookie/proxy session (avoids 429 on tlang tracks)."""
     has_cookies = bool(YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists())
-    player_clients = ["tv", "web", "mweb"] if has_cookies else ["ios", "android", "tv", "web"]
     ydl_opts = {
         "skip_download": True,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 20,
-        "extractor_args": {"youtube": {"player_client": player_clients}},
         **get_ytdlp_js_opts(),
     }
+    if not has_cookies:
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": ["ios", "android", "tv", "web"]}}
     target_url = url or f"https://www.youtube.com/watch?v={video_id}"
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(target_url, download=False)
@@ -1169,13 +1184,14 @@ def encode_smooth_clip(
 
 
 def get_ytdlp_js_opts() -> dict[str, Any]:
-    """Common yt-dlp options: Node.js runtime + optional YouTube cookies + optional proxy."""
-    opts: dict[str, Any] = {}
+    """Common yt-dlp options: IPv4 + Node.js runtime + optional YouTube cookies + optional proxy."""
+    opts: dict[str, Any] = {
+        "source_address": "0.0.0.0",  # Force IPv4 (YouTube flags cloud IPv6 ranges much harder)
+    }
     if shutil.which("node"):
         opts["js_runtimes"] = {"node": {}}
     if YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists():
         opts["cookiefile"] = YOUTUBE_COOKIE_FILE
-        opts["extractor_args"] = {"youtube": {"player_client": ["tv", "web", "mweb"]}}
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
     return opts
@@ -1535,6 +1551,7 @@ def health():
         "upload_enabled": True,
         "youtube_cookies_loaded": bool(YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists()),
         "youtube_cookies_count": YOUTUBE_COOKIES_COUNT,
+        "youtube_auth_cookies_ok": YOUTUBE_AUTH_COOKIES_OK,
         "proxy_configured": bool(PROXY_URL),
     }
 

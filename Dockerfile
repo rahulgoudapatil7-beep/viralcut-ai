@@ -1,4 +1,4 @@
-# ViralCut AI — Single-Container Production Dockerfile (Frontend + FastAPI + FFmpeg + Hindi Fonts)
+﻿# ViralCut AI — Single-Container Production Dockerfile (Frontend + FastAPI + FFmpeg + Hindi Fonts)
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
@@ -30,7 +30,7 @@ RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     python-multipart \
-    yt-dlp \
+    "yt-dlp[default]" \
     youtube-transcript-api \
     imageio-ffmpeg \
     httpx
