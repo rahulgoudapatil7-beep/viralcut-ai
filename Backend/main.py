@@ -22,7 +22,7 @@ from typing import Any
 
 import imageio_ffmpeg
 import yt_dlp
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -53,6 +53,7 @@ PROXY_URL = os.getenv("PROXY_URL", "").strip()
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
 CLIPS_DIR = DATA_DIR / "clips"
+UPLOADS_DIR = DATA_DIR / "uploads"
 FFMPEG_DIR = BASE_DIR / "ffmpeg_bin"
 DB_PATH = DATA_DIR / "viralcut.db"
 SECRET_PATH = DATA_DIR / ".auth_secret"
@@ -61,6 +62,7 @@ FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 FFMPEG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -70,12 +72,17 @@ def setup_youtube_cookies() -> str | None:
     raw = os.getenv("YOUTUBE_COOKIES", "").strip()
     try:
         if b64:
-            decoded = base64.b64decode(b64).decode("utf-8", errors="ignore")
+            # Strip accidental whitespace/newlines inside base64 string
+            clean_b64 = re.sub(r"\s+", "", b64)
+            decoded = base64.b64decode(clean_b64).decode("utf-8", errors="ignore")
             if decoded.strip():
                 COOKIES_PATH.write_text(decoded, encoding="utf-8")
                 print(f"COOKIES CHECK: Loaded from YOUTUBE_COOKIES_B64 ({COOKIES_PATH})")
                 return str(COOKIES_PATH)
         elif raw:
+            # Handle literal \n if Render UI flattened multiline paste
+            if "\\n" in raw and "\n" not in raw:
+                raw = raw.replace("\\n", "\n").replace("\\t", "\t")
             COOKIES_PATH.write_text(raw, encoding="utf-8")
             print(f"COOKIES CHECK: Loaded from YOUTUBE_COOKIES ({COOKIES_PATH})")
             return str(COOKIES_PATH)
@@ -443,138 +450,240 @@ def _parse_vtt_to_segments(vtt_text: str) -> list[dict[str, Any]]:
     return segments
 
 
-def _get_transcript_via_ytdlp(video_id: str, url: str) -> tuple[list[dict[str, Any]], str]:
-    """Fallback transcript fetcher using yt-dlp (supports cookies.txt, proxy, and Android/TV clients)."""
-    tmp_dir = CLIPS_DIR / f"sub_{video_id}_{secrets.token_hex(4)}"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        ydl_opts = {
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitleslangs": ["en", "en-US", "en-IN", "hi", "hi-IN", "all"],
-            "subtitlesformat": "vtt/best",
-            "outtmpl": str(tmp_dir / "%(id)s.%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "socket_timeout": 20,
-            "extractor_args": {"youtube": {"player_client": ["android", "tv", "web"]}},
-            **get_ytdlp_js_opts(),
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url or f"https://www.youtube.com/watch?v={video_id}", download=False)
-            subs = info.get("subtitles") or {}
-            auto_subs = info.get("automatic_captions") or {}
-            combined = {**auto_subs, **subs}
+def _parse_json3_to_segments(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    segs: list[dict[str, Any]] = []
+    for ev in payload.get("events", []):
+        t_ms = ev.get("tStartMs")
+        d_ms = ev.get("dDurationMs", 2000)
+        parts = ev.get("segs") or []
+        txt = "".join(p.get("utf8", "") for p in parts)
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if t_ms is not None and txt:
+            segs.append({
+                "text": txt,
+                "start": round(t_ms / 1000.0, 2),
+                "duration": round(max(0.5, d_ms / 1000.0), 2),
+            })
+    return segs
 
-            # Pick preferred language
-            chosen_lang = None
+
+def _get_transcript_via_innertube(video_id: str) -> tuple[list[dict[str, Any]], str]:
+    """Mobile InnerTube (ANDROID / IOS) transcript fallback — bypasses WEB HTML bot walls on some IPs."""
+    clients = [
+        (
+            "ANDROID",
+            {"clientName": "ANDROID", "clientVersion": "20.10.38", "androidSdkVersion": 30, "hl": "en", "gl": "US"},
+            "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
+        ),
+        (
+            "IOS",
+            {"clientName": "IOS", "clientVersion": "20.10.4", "deviceMake": "Apple", "deviceModel": "iPhone16,2", "hl": "en", "gl": "US"},
+            "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+        ),
+    ]
+    opener = urllib.request.build_opener()
+    if PROXY_URL:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})
+        )
+
+    last_err = "InnerTube returned no caption tracks."
+    for name, ctx, ua in clients:
+        try:
+            body = json.dumps({"context": {"client": ctx}, "videoId": video_id}).encode("utf-8")
+            req = urllib.request.Request(
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": ua},
+            )
+            with opener.open(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+            tracks = (
+                data.get("captions", {})
+                .get("playerCaptionsTracklistRenderer", {})
+                .get("captionTracks", [])
+            )
+            if not tracks:
+                reason = data.get("playabilityStatus", {}).get("reason", "")
+                last_err = f"{name}: {reason or 'no captions'}"
+                continue
+
+            # Prefer English, then Hindi, then first available
+            chosen = None
             for pref in ("en", "en-US", "en-GB", "en-IN", "hi", "hi-IN"):
-                if pref in combined:
-                    chosen_lang = pref
+                chosen = next((t for t in tracks if t.get("languageCode") == pref), None)
+                if chosen:
                     break
-            if not chosen_lang and combined:
-                chosen_lang = next(iter(combined.keys()))
-            if not chosen_lang:
-                raise RuntimeError("No subtitles or auto-captions found for this video.")
+            if not chosen:
+                chosen = tracks[0]
 
-            formats = combined[chosen_lang]
-            vtt_entry = next((f for f in formats if f.get("ext") == "vtt" and f.get("url")), None)
+            lang = chosen.get("languageCode") or "auto"
+            base_url = chosen.get("baseUrl", "")
+            if not base_url:
+                continue
+            sep = "&" if "?" in base_url else "?"
+            tr_req = urllib.request.Request(f"{base_url}{sep}fmt=json3", headers={"User-Agent": ua})
+            with opener.open(tr_req, timeout=15) as tr_resp:
+                payload = json.loads(tr_resp.read().decode("utf-8", errors="ignore"))
+            segs = _parse_json3_to_segments(payload)
+            if segs:
+                return segs, lang
+        except Exception as exc:
+            last_err = f"{name}: {exc}"
+    raise RuntimeError(last_err)
+
+
+def _get_transcript_via_ytdlp(video_id: str, url: str) -> tuple[list[dict[str, Any]], str]:
+    """Authenticated yt-dlp subtitle fetcher using yt-dlp's own cookie/proxy session (avoids 429 on tlang tracks)."""
+    has_cookies = bool(YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists())
+    player_clients = ["tv", "web", "mweb"] if has_cookies else ["ios", "android", "tv", "web"]
+    ydl_opts = {
+        "skip_download": True,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 20,
+        "extractor_args": {"youtube": {"player_client": player_clients}},
+        **get_ytdlp_js_opts(),
+    }
+    target_url = url or f"https://www.youtube.com/watch?v={video_id}"
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(target_url, download=False)
+        subs = (info or {}).get("subtitles") or {}
+        auto_subs = (info or {}).get("automatic_captions") or {}
+
+        # Avoid YouTube's rate-limited auto-translated URLs (tlang=) by preferring manual subs, then original auto-subs!
+        def is_original(formats: list[dict[str, Any]]) -> bool:
+            return any(f.get("url") and "tlang=" not in f["url"] for f in formats)
+
+        candidate_langs: list[tuple[str, list[dict[str, Any]]]] = []
+        # 1. Manual subtitles (prefer en, hi, then any)
+        for pref in ("en", "en-US", "en-GB", "en-IN", "hi", "hi-IN"):
+            if pref in subs:
+                candidate_langs.append((pref, subs[pref]))
+        for k, v in subs.items():
+            if not any(x[0] == k for x in candidate_langs):
+                candidate_langs.append((k, v))
+
+        # 2. Original (non-translated) automatic captions first
+        for k, v in auto_subs.items():
+            if is_original(v) and not any(x[0] == k for x in candidate_langs):
+                candidate_langs.append((k, v))
+
+        # 3. Translated automatic captions only as last resort
+        for pref in ("en", "hi"):
+            if pref in auto_subs and not any(x[0] == pref for x in candidate_langs):
+                candidate_langs.append((pref, auto_subs[pref]))
+
+        if not candidate_langs:
+            raise RuntimeError("No subtitles or auto-captions found for this video.")
+
+        last_err = "Subtitle stream could not be fetched."
+        for chosen_lang, formats in candidate_langs[:3]:
             json3_entry = next((f for f in formats if f.get("ext") == "json3" and f.get("url")), None)
+            vtt_entry = next((f for f in formats if f.get("ext") == "vtt" and f.get("url")), None)
+            for kind, entry in (("json3", json3_entry), ("vtt", vtt_entry)):
+                if not entry:
+                    continue
+                try:
+                    # Use yt-dlp's own urlopen so cookies + proxy + headers are sent automatically!
+                    raw_bytes = ydl.urlopen(entry["url"]).read()
+                    text_body = raw_bytes.decode("utf-8", errors="ignore")
+                    if kind == "json3":
+                        segs = _parse_json3_to_segments(json.loads(text_body))
+                    else:
+                        segs = _parse_vtt_to_segments(text_body)
+                    if segs:
+                        return segs, chosen_lang
+                except Exception as exc:
+                    last_err = f"{chosen_lang}/{kind}: {exc}"
+        raise RuntimeError(last_err)
 
-            opener = urllib.request.build_opener()
-            if PROXY_URL:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})
-                )
 
-            if json3_entry:
-                req = urllib.request.Request(json3_entry["url"], headers={"User-Agent": "Mozilla/5.0"})
-                with opener.open(req, timeout=15) as resp:
-                    payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                segs: list[dict[str, Any]] = []
-                for ev in payload.get("events", []):
-                    t_ms = ev.get("tStartMs")
-                    d_ms = ev.get("dDurationMs", 2000)
-                    parts = ev.get("segs") or []
-                    txt = "".join(p.get("utf8", "") for p in parts)
-                    txt = re.sub(r"\s+", " ", txt).strip()
-                    if t_ms is not None and txt:
-                        segs.append({
-                            "text": txt,
-                            "start": round(t_ms / 1000.0, 2),
-                            "duration": round(max(0.5, d_ms / 1000.0), 2),
-                        })
-                if segs:
-                    return segs, chosen_lang
+def _fetch_transcript_primary_api(video_id: str) -> tuple[list[dict[str, Any]], str]:
+    proxy_cfg = None
+    if PROXY_URL:
+        try:
+            from youtube_transcript_api.proxies import GenericProxyConfig
 
-            if vtt_entry:
-                req = urllib.request.Request(vtt_entry["url"], headers={"User-Agent": "Mozilla/5.0"})
-                with opener.open(req, timeout=15) as resp:
-                    vtt_text = resp.read().decode("utf-8", errors="ignore")
-                segs = _parse_vtt_to_segments(vtt_text)
-                if segs:
-                    return segs, chosen_lang
+            class RotatingProxyConfig(GenericProxyConfig):
+                @property
+                def prevent_keeping_connections_alive(self) -> bool:
+                    return True
 
-            raise RuntimeError("Subtitle stream could not be parsed.")
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+                @property
+                def retries_when_blocked(self) -> int:
+                    return 5
+
+            proxy_cfg = RotatingProxyConfig(http_url=PROXY_URL, https_url=PROXY_URL)
+        except Exception:
+            proxy_cfg = None
+
+    api = YouTubeTranscriptApi(proxy_config=proxy_cfg) if proxy_cfg else YouTubeTranscriptApi()
+    if hasattr(api, "list"):
+        transcript_list = api.list(video_id)
+    else:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+    try:
+        transcript = transcript_list.find_transcript(["en", "en-US", "en-GB", "en-IN"])
+    except Exception:
+        transcript = next(iter(transcript_list))
+
+    lang = getattr(transcript, "language_code", "auto")
+    fetched = transcript.fetch()
+    segments: list[dict[str, Any]] = []
+    for s in fetched:
+        if isinstance(s, dict):
+            text = str(s.get("text", "")).strip()
+            start = float(s.get("start", 0.0))
+            dur = float(s.get("duration", 2.0))
+        else:
+            text = str(getattr(s, "text", "")).strip()
+            start = float(getattr(s, "start", 0.0))
+            dur = float(getattr(s, "duration", 2.0))
+        if text:
+            segments.append({"text": text, "start": round(start, 2), "duration": round(dur, 2)})
+    if not segments:
+        raise RuntimeError("Transcript was empty.")
+    return segments, lang
 
 
 def get_transcript(video_id: str, url: str = "") -> tuple[list[dict[str, Any]], str]:
-    """Fetch English transcript if available, otherwise any language (e.g., Hindi). Auto-falls back to yt-dlp."""
-    first_err: Exception | None = None
-    try:
-        proxy_cfg = None
-        if PROXY_URL:
-            try:
-                from youtube_transcript_api.proxies import GenericProxyConfig
-                proxy_cfg = GenericProxyConfig(http_url=PROXY_URL, https_url=PROXY_URL)
-            except Exception:
-                proxy_cfg = None
+    """Fetch transcript with multi-layer cloud fallback: cookies yt-dlp -> primary API -> InnerTube mobile -> yt-dlp."""
+    has_cookies = bool(YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists())
+    errors: list[str] = []
 
-        api = YouTubeTranscriptApi(proxy_config=proxy_cfg) if proxy_cfg else YouTubeTranscriptApi()
-        if hasattr(api, "list"):
-            transcript_list = api.list(video_id)
-        else:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+    # Build ordered strategies: if cookies are configured (without proxy), use authenticated yt-dlp FIRST!
+    strategies: list[tuple[str, Any]] = []
+    if has_cookies and not PROXY_URL:
+        strategies.append(("yt-dlp (cookies)", lambda: _get_transcript_via_ytdlp(video_id, url)))
+        strategies.append(("innertube-mobile", lambda: _get_transcript_via_innertube(video_id)))
+        strategies.append(("youtube-transcript-api", lambda: _fetch_transcript_primary_api(video_id)))
+    else:
+        strategies.append(("youtube-transcript-api", lambda: _fetch_transcript_primary_api(video_id)))
+        strategies.append(("innertube-mobile", lambda: _get_transcript_via_innertube(video_id)))
+        strategies.append(("yt-dlp", lambda: _get_transcript_via_ytdlp(video_id, url)))
 
+    for label, fn in strategies:
         try:
-            transcript = transcript_list.find_transcript(["en", "en-US", "en-GB", "en-IN"])
-        except Exception:
-            transcript = next(iter(transcript_list))
+            segs, lang = fn()
+            if segs:
+                print(f"[TRANSCRIPT] OK via {label} ({lang}, {len(segs)} segments)")
+                return segs, lang
+        except Exception as exc:
+            msg = str(exc).strip()
+            errors.append(f"{label}: {msg[:140]}")
+            print(f"[TRANSCRIPT] {label} failed -> {msg[:140]}")
 
-        lang = getattr(transcript, "language_code", "auto")
-        fetched = transcript.fetch()
-        segments: list[dict[str, Any]] = []
-        for s in fetched:
-            if isinstance(s, dict):
-                text = str(s.get("text", "")).strip()
-                start = float(s.get("start", 0.0))
-                dur = float(s.get("duration", 2.0))
-            else:
-                text = str(getattr(s, "text", "")).strip()
-                start = float(getattr(s, "start", 0.0))
-                dur = float(getattr(s, "duration", 2.0))
-            if text:
-                segments.append({"text": text, "start": round(start, 2), "duration": round(dur, 2)})
-        if segments:
-            return segments, lang
-    except Exception as exc:
-        first_err = exc
-        print(f"[TRANSCRIPT] Primary API blocked/failed ({str(exc)[:120]}), trying yt-dlp fallback...")
-
-    # Fallback: yt-dlp with cookies/proxy/mobile client
-    try:
-        return _get_transcript_via_ytdlp(video_id, url)
-    except Exception as exc2:
-        err_msg = str(first_err or exc2)
-        if "blocking" in err_msg.lower() or "bot" in err_msg.lower() or "sign in" in err_msg.lower():
-            raise RuntimeError(
-                "YouTube is blocking this cloud server's IP. Add PROXY_URL (free Webshare residential proxy) or YOUTUBE_COOKIES in Render Environment Variables — or click 'Try Instant Demo Video' to test right now!"
-            ) from exc2
-        raise RuntimeError(err_msg[:180]) from exc2
+    combined = " | ".join(errors)
+    low = combined.lower()
+    if any(k in low for k in ("blocking", "bot", "sign in", "ip", "429", "forbidden", "login_required")):
+        raise RuntimeError(
+            "YouTube blocked this cloud server's IP. Easy fix: click 'Upload Video (MP4)' right above (100% free & never blocked), or add YOUTUBE_COOKIES_B64 in Render Environment Variables to unlock YouTube links!"
+        )
+    raise RuntimeError(errors[0] if errors else "Could not fetch YouTube transcript.")
 
 
 STOP_WORDS = {
@@ -1000,6 +1109,7 @@ def get_ytdlp_js_opts() -> dict[str, Any]:
         opts["js_runtimes"] = {"node": {}}
     if YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists():
         opts["cookiefile"] = YOUTUBE_COOKIE_FILE
+        opts["extractor_args"] = {"youtube": {"player_client": ["tv", "web", "mweb"]}}
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
     return opts
@@ -1356,6 +1466,9 @@ def health():
         "font": FONT_NAME,
         "max_height": MAX_HEIGHT,
         "captions_enabled": CAPTIONS,
+        "upload_enabled": True,
+        "youtube_cookies_loaded": bool(YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists()),
+        "proxy_configured": bool(PROXY_URL),
     }
 
 
@@ -1758,6 +1871,212 @@ def analyze_video(body: AnalyzeRequest, user: dict[str, Any] = Depends(get_curre
     }
 
 
+def probe_local_duration(video_path: Path) -> float:
+    if not FFMPEG_BIN:
+        return 0.0
+    res = subprocess.run([FFMPEG_BIN, "-i", str(video_path)], capture_output=True, text=True, timeout=30)
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr or "")
+    if not m:
+        return 0.0
+    return round(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)), 2)
+
+
+def detect_uploaded_video_moments(
+    video_path: Path,
+    duration: float,
+    clip_len: int,
+    max_clips: int,
+    video_title: str,
+) -> list[dict[str, Any]]:
+    """Detect high-energy moments on uploaded videos using FFmpeg audio loudness peaks (works 100% offline/cloud!)."""
+    if duration <= 3:
+        return []
+    window_len = min(float(clip_len), max(5.0, duration))
+    bucket_sec = max(2, min(5, int(duration // 20) or 2))
+    num_buckets = max(1, min(180, int(math.ceil(duration / bucket_sec))))
+
+    energy: list[float] = []
+    if FFMPEG_BIN:
+        res = subprocess.run(
+            [
+                FFMPEG_BIN, "-i", str(video_path), "-vn",
+                "-af", "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
+                "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        raw = (res.stdout or "") + "\n" + (res.stderr or "")
+        buckets: list[list[float]] = [[] for _ in range(num_buckets)]
+        cur_t = 0.0
+        for line in raw.splitlines():
+            mt = re.search(r"pts_time:([0-9.]+)", line)
+            if mt:
+                cur_t = float(mt.group(1))
+            mv = re.search(r"RMS_level=([-0-9.]+)", line)
+            if mv:
+                db = float(mv.group(1))
+                if not math.isnan(db) and not math.isinf(db):
+                    norm = max(0.05, min(1.0, (db + 55.0) / 48.0))
+                    idx = min(num_buckets - 1, max(0, int(cur_t // bucket_sec)))
+                    buckets[idx].append(norm)
+        if any(buckets):
+            energy = [sum(b) / len(b) if b else 0.45 for b in buckets]
+
+    if not energy:
+        energy = [0.6 + 0.35 * abs(math.sin((i + 1) * 1.1)) for i in range(num_buckets)]
+
+    step = max(3.0, window_len / 3.0)
+    candidates: list[dict[str, Any]] = []
+    t = 0.0
+    while t < duration:
+        start = round(t, 2)
+        end = round(min(duration, start + window_len), 2)
+        if end - start < min(5.0, duration):
+            break
+        bs = min(len(energy) - 1, max(0, int(start // bucket_sec)))
+        be = min(len(energy) - 1, max(bs, int(end // bucket_sec)))
+        win = energy[bs : be + 1]
+        avg_e = sum(win) / max(1, len(win))
+        peak_e = max(win) if win else avg_e
+        score = max(68, min(99, int(round(58 + (0.55 * avg_e + 0.45 * peak_e) * 40))))
+        candidates.append({
+            "start": start,
+            "end": end,
+            "duration": round(end - start, 1),
+            "score": score,
+            "reason": f"Peak audio energy ({int(peak_e * 100)}%) · High engagement segment",
+        })
+        if end >= duration:
+            break
+        t += step
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    selected: list[dict[str, Any]] = []
+    for cand in candidates:
+        overlaps = any(
+            not (cand["end"] <= s["start"] + 1.5 or cand["start"] >= s["end"] - 1.5)
+            for s in selected
+        )
+        if not overlaps:
+            selected.append(cand)
+        if len(selected) >= max_clips:
+            break
+
+    selected.sort(key=lambda c: c["score"], reverse=True)
+    for idx, item in enumerate(selected, start=1):
+        meta = generate_clip_metadata(
+            video_title=video_title,
+            snippet_text=f"High-energy highlight #{idx} from {video_title}",
+            rank=idx,
+            duration_sec=item["duration"],
+            lang="en",
+        )
+        item["rank"] = idx
+        item["title"] = meta["viral_title"]
+        item["description"] = meta["description"]
+        item["hashtags"] = meta["hashtags"]
+    return selected
+
+
+def cut_uploaded_section(source_path: Path, video_id: str, start: float, end: float) -> tuple[Path, bool, str | None]:
+    if not FFMPEG_BIN or not source_path.exists():
+        raise RuntimeError("Uploaded source video not found on server.")
+    start_i = max(0, int(math.floor(start)))
+    end_i = max(start_i + 3, int(math.ceil(end)))
+    tag = f"{video_id}_{start_i}_{end_i}_{MAX_HEIGHT}p_v3"
+    raw_path = CLIPS_DIR / f"{tag}_raw.mp4"
+    final_path = CLIPS_DIR / f"{tag}.mp4"
+    if final_path.exists() and final_path.stat().st_size > 10_000:
+        return final_path, False, None
+
+    subprocess.run(
+        [
+            FFMPEG_BIN, "-y",
+            "-ss", f"{start:.2f}",
+            "-i", str(source_path),
+            "-t", f"{max(2.0, end - start):.2f}",
+            "-c", "copy",
+            str(raw_path),
+        ],
+        capture_output=True, timeout=90, check=True,
+    )
+    ok, err = encode_smooth_clip(raw_path, final_path)
+    raw_path.unlink(missing_ok=True)
+    if not ok:
+        raise RuntimeError(f"Failed encoding uploaded clip: {err[-200:]}")
+    return final_path, False, None
+
+
+@app.post("/api/upload")
+async def upload_video(
+    file: UploadFile = File(...),
+    clip_length: int = Form(30),
+    max_clips: int = Form(5),
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    """Upload any MP4/MOV/WebM/MKV directly — works 100% on Render with ZERO YouTube IP blocks!"""
+    orig_name = file.filename or "uploaded_video.mp4"
+    ext = Path(orig_name).suffix.lower()
+    if ext not in (".mp4", ".mov", ".webm", ".mkv", ".m4v"):
+        raise HTTPException(status_code=400, detail="Please upload an MP4, MOV, WebM, or MKV video file.")
+
+    clip_length = clip_length if clip_length in (30, 45, 60) else 30
+    max_clips = max_clips if max_clips in (5, 10, 20) else 5
+
+    vid_id = f"up_{secrets.token_hex(5)}"
+    saved_path = UPLOADS_DIR / f"{vid_id}{ext}"
+    with saved_path.open("wb") as out_f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            out_f.write(chunk)
+
+    duration = probe_local_duration(saved_path)
+    if duration <= 2:
+        saved_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Could not read video duration. Ensure the file is a valid video.")
+
+    clean_title = Path(orig_name).stem.replace("_", " ").replace("-", " ").strip() or "Uploaded Video"
+    suggestions = detect_uploaded_video_moments(saved_path, duration, clip_length, max_clips, clean_title)
+    if not suggestions:
+        raise HTTPException(status_code=400, detail="Video is too short to generate clips.")
+
+    top_score = max(s["score"] for s in suggestions)
+    now = datetime.now(timezone.utc).isoformat()
+    src_url = f"upload://{saved_path.name}"
+
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO projects (user_id, video_id, url, title, thumbnail, duration, language, top_score, clip_length, max_clips, suggestions_json, transcript_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"], vid_id, src_url, clean_title, None, duration, "auto",
+                top_score, clip_length, max_clips, json.dumps(suggestions), "[]", now,
+            ),
+        )
+        proj_id = cur.lastrowid
+
+    return {
+        "project": {
+            "id": proj_id,
+            "video_id": vid_id,
+            "url": src_url,
+            "title": clean_title,
+            "thumbnail": None,
+            "duration": duration,
+            "language": "auto",
+            "top_score": top_score,
+            "clip_length": clip_length,
+            "max_clips": max_clips,
+            "suggestions": suggestions,
+            "created_at": now,
+        }
+    }
+
+
 @app.post("/api/demo")
 def create_demo(user: dict[str, Any] = Depends(get_current_user)):
     project = create_demo_project_for_user(user["id"])
@@ -1784,6 +2103,14 @@ def cut_clip(body: CutClipRequest, user: dict[str, Any] = Depends(get_current_us
                 transcript,
                 with_captions=body.captions,
                 caption_theme=body.caption_theme,
+            )
+        elif str(proj["url"]).startswith("upload://"):
+            fname = str(proj["url"]).replace("upload://", "", 1)
+            out_path, has_cc, note = cut_uploaded_section(
+                UPLOADS_DIR / Path(fname).name,
+                proj["video_id"],
+                body.start,
+                body.end,
             )
         else:
             out_path, has_cc, note = cut_youtube_section(
@@ -1909,4 +2236,3 @@ def serve_spa_fallback(full_path: str):
     if index_file.exists():
         return FileResponse(index_file)
     raise HTTPException(status_code=404, detail="Not found.")
-
