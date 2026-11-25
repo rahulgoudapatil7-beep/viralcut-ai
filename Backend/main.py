@@ -1,9 +1,11 @@
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import json
 import math
 import os
+import random
 import re
 import secrets
 import shutil
@@ -65,6 +67,251 @@ SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")  # Paste your 16-char Gma
 # Option A: Set PROXY_URL env var in Render (e.g. http://user:pass@p.webshare.io:80)
 # Option B: Set YOUTUBE_COOKIES or YOUTUBE_COOKIES_B64 env var in Render (exported Netscape cookies.txt)
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
+
+# Max size for an uploaded video (Render Free disk/RAM are small; keep this sane).
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "95"))
+
+# ============================================================
+# FREE PROXY POOL — auto-discovers free proxies that YouTube accepts.
+# Used ONLY when PROXY_URL is empty (a paid proxy always wins).
+# ============================================================
+FREE_POOL_ENABLED = os.getenv("FREE_PROXY_POOL", "1").strip().lower() not in (
+    "0", "false", "no", "off"
+)
+FREE_POOL_TTL = int(os.getenv("FREE_PROXY_POOL_TTL", "1800"))       # refresh every 30 min
+# Proxies that have already proven they can serve video bytes get tested first.
+FREE_PROXY_SEEDS = [
+    s.strip()
+    for s in os.getenv(
+        "FREE_PROXY_SEEDS", "189.51.168.165:999,89.106.84.72:1081,102.244.78.61:8089"
+    ).split(",")
+    if s.strip()
+]
+def _free_pool_path() -> "Path":
+    return DATA_DIR / "proxy_pool.json"
+FREE_PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+]
+PROXY_POOL: dict[str, Any] = {
+    "proxies": [],
+    "idx": 0,
+    "updated_at": 0.0,
+    "status": "idle",
+    "candidates": 0,
+    "reachable": 0,
+    "last_error": "",
+}
+POOL_LOCK = threading.Lock()
+
+
+def _pool_load() -> None:
+    try:
+        if _free_pool_path().exists():
+            data = json.loads(_free_pool_path().read_text())
+            with POOL_LOCK:
+                PROXY_POOL.update(
+                    {
+                        "proxies": data.get("proxies", []),
+                        "updated_at": data.get("updated_at", 0.0),
+                        "status": "ready" if data.get("proxies") else "idle",
+                        "candidates": data.get("candidates", 0),
+                        "reachable": data.get("reachable", 0),
+                    }
+                )
+            print(f"[FREE POOL] loaded {len(PROXY_POOL['proxies'])} proxies from disk")
+    except Exception as exc:
+        print(f"[FREE POOL] load failed: {exc}")
+
+
+def _pool_save() -> None:
+    try:
+        with POOL_LOCK:
+            payload = {
+                "proxies": list(PROXY_POOL["proxies"]),
+                "updated_at": PROXY_POOL["updated_at"],
+                "candidates": PROXY_POOL["candidates"],
+                "reachable": PROXY_POOL["reachable"],
+            }
+        _free_pool_path().write_text(json.dumps(payload))
+    except Exception as exc:
+        print(f"[FREE POOL] save failed: {exc}")
+
+
+def get_active_proxy() -> str:
+    """Paid PROXY_URL wins; otherwise use the current free-pool proxy."""
+    if PROXY_URL:
+        return PROXY_URL
+    with POOL_LOCK:
+        proxies = list(PROXY_POOL.get("proxies") or [])
+        idx = int(PROXY_POOL.get("idx") or 0)
+    if not proxies:
+        return ""
+    return proxies[idx % len(proxies)]
+
+
+def _rotate_free_proxy() -> str:
+    """Advance to the next free proxy (used after a failure)."""
+    if PROXY_URL:
+        return PROXY_URL
+    with POOL_LOCK:
+        proxies = list(PROXY_POOL.get("proxies") or [])
+        if proxies:
+            PROXY_POOL["idx"] = (int(PROXY_POOL.get("idx") or 0) + 1) % len(proxies)
+            return proxies[int(PROXY_POOL["idx"])]
+    return ""
+
+
+def _using_free_pool() -> bool:
+    return not bool(PROXY_URL) and bool(get_active_proxy())
+
+
+def _pool_fetch_candidates(limit: int = 400) -> list[str]:
+    found: list[str] = []
+    for url in FREE_PROXY_SOURCES:
+        try:
+            with httpx.Client(timeout=25, follow_redirects=True) as client:
+                text = client.get(url).text
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                line = re.sub(r"^\w+://", "", line)
+                if re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$", line):
+                    found.append(line)
+        except Exception as exc:
+            print(f"[FREE POOL] source failed ({url.split('/')[4][:20]}): {exc}")
+    # de-duplicate, shuffle so we sample different proxies each refresh
+    found = list(dict.fromkeys(found))
+    random.shuffle(found)
+    # Seeds (previously proven) go first so they're always re-tested.
+    head = [s for s in FREE_PROXY_SEEDS if s not in found]
+    return head + found[: max(0, limit - len(head))]
+
+
+def _probe_reachable(addr: str) -> bool:
+    try:
+        with httpx.Client(proxy=f"http://{addr}", timeout=8, follow_redirects=False) as client:
+            res = client.get("https://www.youtube.com/generate_204")
+        return res.status_code in (200, 204)
+    except Exception:
+        return False
+
+
+def _probe_youtube(addr: str) -> bool:
+    """A proxy is only useful if it can (a) read player data AND (b) fetch media bytes.
+
+    Many free proxies pass step (a) but return 403 on googlevideo, which is exactly
+    what made clips fail. So we range-request a few hundred KB from the CDN too.
+    """
+    try:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "proxy": f"http://{addr}",
+            "socket_timeout": 15,
+            "retries": 0,
+            "extractor_retries": 0,
+            "source_address": "0.0.0.0",
+            "format": "bestvideo[height<=720][ext=mp4]/best[height<=720]/best",
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                "https://www.youtube.com/watch?v=Dz0naoD1QWo", download=False
+            )
+        req = info.get("requested_formats") or []
+        media = (req[0] if req else info).get("url")
+        headers = (req[0] if req else info).get("http_headers") or {}
+        if not media:
+            return False
+        headers = dict(headers)
+        headers["Range"] = "bytes=0-262143"
+        with httpx.Client(proxy=f"http://{addr}", timeout=25, follow_redirects=True) as client:
+            res = client.get(media, headers=headers)
+        ok = res.status_code in (200, 206) and len(res.content) > 50_000
+        if not ok:
+            print(f"[FREE POOL]   ✗ {addr} player ok but media {res.status_code}")
+        return ok
+    except Exception as exc:
+        if "403" in str(exc):
+            print(f"[FREE POOL]   ✗ {addr} media 403")
+        return False
+
+
+def refresh_free_pool(max_candidates: int = 600, max_deep: int = 24) -> dict[str, Any]:
+    """Fetch free proxy lists, keep only the ones that really work with YouTube."""
+    with POOL_LOCK:
+        if PROXY_POOL.get("status") == "testing":
+            return {"status": "already testing"}
+        PROXY_POOL["status"] = "testing"
+        PROXY_POOL["last_error"] = ""
+
+    started = time.time()
+    try:
+        print("[FREE POOL] refreshing: fetching free proxy lists...")
+        candidates = _pool_fetch_candidates(max_candidates)
+        with POOL_LOCK:
+            PROXY_POOL["candidates"] = len(candidates)
+        if not candidates:
+            raise RuntimeError("no candidates found")
+
+        print(f"[FREE POOL] testing {len(candidates)} proxies for YouTube reachability...")
+        reachable: list[str] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=60) as ex:
+            for addr, ok in zip(candidates, ex.map(_probe_reachable, candidates)):
+                if ok:
+                    reachable.append(addr)
+        with POOL_LOCK:
+            PROXY_POOL["reachable"] = len(reachable)
+        print(f"[FREE POOL] {len(reachable)} reachable -> deep-testing {min(len(reachable), max_deep)}")
+
+        sample = reachable[:max_deep]
+        working: list[str] = []
+        if sample:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                for addr, ok in zip(sample, ex.map(_probe_youtube, sample)):
+                    if ok:
+                        working.append(addr)
+                        print(f"[FREE POOL]   ✅ {addr}")
+
+        with POOL_LOCK:
+            if working:
+                PROXY_POOL["proxies"] = working
+                PROXY_POOL["updated_at"] = time.time()
+                PROXY_POOL["status"] = "ready"
+            else:
+                PROXY_POOL["status"] = "ready" if PROXY_POOL["proxies"] else "empty"
+        if working:
+            _pool_save()
+        print(f"[FREE POOL] done in {time.time()-started:.0f}s -> {len(working)} working proxies")
+        return {"working": working, "elapsed": round(time.time() - started, 1)}
+    except Exception as exc:
+        with POOL_LOCK:
+            PROXY_POOL["status"] = "error"
+            PROXY_POOL["last_error"] = str(exc)[:200]
+        print(f"[FREE POOL] refresh failed: {exc}")
+        return {"error": str(exc)[:200]}
+
+
+def _pool_keeper() -> None:
+    """Background loop: keep the pool fresh, but only when no paid proxy is set."""
+    time.sleep(5)
+    while True:
+        try:
+            if FREE_POOL_ENABLED and not PROXY_URL:
+                stale = time.time() - float(PROXY_POOL.get("updated_at") or 0) > FREE_POOL_TTL
+                if stale and PROXY_POOL.get("status") != "testing":
+                    refresh_free_pool()
+        except Exception as exc:
+            print(f"[FREE POOL] keeper error: {exc}")
+        time.sleep(120)
+
+
+
+# Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
+BUILD_TAG = "2026-11-25-upload-only"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -578,9 +825,10 @@ def _get_transcript_via_innertube(video_id: str) -> tuple[list[dict[str, Any]], 
         ),
     ]
     opener = urllib.request.build_opener()
-    if PROXY_URL:
+    _active = get_active_proxy()
+    if _active:
         opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})
+            urllib.request.ProxyHandler({"http": _active, "https": _active})
         )
 
     last_err = "InnerTube returned no caption tracks."
@@ -699,7 +947,7 @@ def _get_transcript_via_ytdlp(video_id: str, url: str) -> tuple[list[dict[str, A
 
 def _fetch_transcript_primary_api(video_id: str) -> tuple[list[dict[str, Any]], str]:
     proxy_cfg = None
-    if PROXY_URL:
+    if get_active_proxy():
         try:
             from youtube_transcript_api.proxies import GenericProxyConfig
 
@@ -712,7 +960,8 @@ def _fetch_transcript_primary_api(video_id: str) -> tuple[list[dict[str, Any]], 
                 def retries_when_blocked(self) -> int:
                     return 5
 
-            proxy_cfg = RotatingProxyConfig(http_url=PROXY_URL, https_url=PROXY_URL)
+            _active = get_active_proxy()
+            proxy_cfg = RotatingProxyConfig(http_url=_active, https_url=_active)
         except Exception:
             proxy_cfg = None
 
@@ -753,7 +1002,7 @@ def get_transcript(video_id: str, url: str = "") -> tuple[list[dict[str, Any]], 
 
     # Build ordered strategies: if cookies are configured (without proxy), use authenticated yt-dlp FIRST!
     strategies: list[tuple[str, Any]] = []
-    if has_cookies and not PROXY_URL:
+    if has_cookies and not get_active_proxy():
         strategies.append(("yt-dlp (cookies)", lambda: _get_transcript_via_ytdlp(video_id, url)))
         strategies.append(("innertube-mobile", lambda: _get_transcript_via_innertube(video_id)))
         strategies.append(("youtube-transcript-api", lambda: _fetch_transcript_primary_api(video_id)))
@@ -1210,8 +1459,12 @@ def get_ytdlp_js_opts() -> dict[str, Any]:
         opts["js_runtimes"] = {"node": {}}
     if YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists():
         opts["cookiefile"] = YOUTUBE_COOKIE_FILE
-    if PROXY_URL:
-        opts["proxy"] = PROXY_URL
+    _active = get_active_proxy()
+    if _active:
+        opts["proxy"] = _active
+        if not PROXY_URL:
+            # Free public proxies are slow: allow much longer socket timeouts.
+            opts["socket_timeout"] = 45
     return opts
 
 
@@ -1240,12 +1493,21 @@ def cut_youtube_section(
             except Exception:
                 pass
 
+    # Adaptive profile: free public proxies are slow & flaky, so pull less data,
+    # wait longer, and try more of them before giving up.
+    free_mode = _using_free_pool()
+    max_h = 720 if free_mode else MAX_HEIGHT
+    copy_timeout = 330 if free_mode else 150
+    attempt_heights = [max_h, max_h, 480, 480] if free_mode else [max_h, max_h, max_h]
+    if free_mode:
+        print(f"[CLIP] Free public proxy mode: {max_h}p cap, {copy_timeout}s per attempt")
+
     start_i = max(0, int(math.floor(start)))
     end_i = max(start_i + 5, int(math.ceil(end)))
     clip_dur = max(3.0, end - start)
     theme_slug = caption_theme if caption_theme in CAPTION_THEMES else "gold"
     want_cc = bool(with_captions and CAPTIONS and transcript)
-    tag = f"{video_id}_{start_i}_{end_i}_{MAX_HEIGHT}p_{theme_slug}_v3"
+    tag = f"{video_id}_{start_i}_{end_i}_{max_h}p_{theme_slug}_v3"
     raw_path = CLIPS_DIR / f"{tag}_raw.mp4"
     final_name = f"{tag}_cc.mp4" if want_cc else f"{tag}.mp4"
     final_path = CLIPS_DIR / final_name
@@ -1261,24 +1523,25 @@ def cut_youtube_section(
         else (False, None)
     )
 
-    fmt = (
-        f"bestvideo[height<={MAX_HEIGHT}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/"
-        f"bestvideo[height<={MAX_HEIGHT}][ext=mp4]+bestaudio[ext=m4a]/"
-        f"best[height<={MAX_HEIGHT}][ext=mp4]/best[height<={MAX_HEIGHT}]/best"
-    )
+    def _fmt_for(h: int) -> str:
+        return (
+            f"bestvideo[height<={h}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"best[height<={h}][ext=mp4]/best[height<={h}]/best"
+        )
 
     # ---- STAGE 1: Fast raw download to local disk (NO encoding while reading HTTP!) ----
-    print(f"[CLIP] Stage 1/2: Fast-fetching {clip_dur:.0f}s section ({start_i}s-{end_i}s, {MAX_HEIGHT}p)...")
+    print(f"[CLIP] Stage 1/2: Fast-fetching {clip_dur:.0f}s section ({start_i}s-{end_i}s, {max_h}p)...")
     _p(f"Downloading {clip_dur:.0f}s section from YouTube...")
     if raw_path.exists():
         raw_path.unlink(missing_ok=True)
 
     downloaded_raw = False
 
-    def _fast_copy_once() -> bool:
+    def _fast_copy_once(height: int | None = None) -> bool:
         """Extract fresh stream URLs and range-copy ONLY this clip section."""
         info_opts = {
-            "format": fmt,
+            "format": _fmt_for(height or max_h),
             "skip_download": True,
             "noplaylist": True,
             "quiet": True,
@@ -1323,6 +1586,7 @@ def cut_youtube_section(
             ]
         ff_copy += [
             "-t", f"{pad_dur:.2f}",
+            "-rw_timeout", "45000000",   # bail out of a stalled socket instead of hanging
             "-c", "copy",
             "-avoid_negative_ts", "make_zero",
             str(raw_path),
@@ -1330,33 +1594,43 @@ def cut_youtube_section(
         # FFmpeg must ALSO exit through the residential proxy, otherwise
         # googlevideo.com rejects the datacenter IP (403) and the copy stalls.
         ff_env = None
-        if PROXY_URL:
+        _active = get_active_proxy()
+        if _active:
             ff_env = {
                 **os.environ,
-                "http_proxy": PROXY_URL,
-                "https_proxy": PROXY_URL,
-                "HTTP_PROXY": PROXY_URL,
-                "HTTPS_PROXY": PROXY_URL,
-                "ALL_PROXY": PROXY_URL,
+                "http_proxy": _active,
+                "https_proxy": _active,
+                "HTTP_PROXY": _active,
+                "HTTPS_PROXY": _active,
+                "ALL_PROXY": _active,
             }
-        r_copy = subprocess.run(
-            ff_copy, capture_output=True, text=True, timeout=150, env=ff_env
-        )
+        try:
+            r_copy = subprocess.run(
+                ff_copy, capture_output=True, text=True, timeout=copy_timeout, env=ff_env
+            )
+        except subprocess.TimeoutExpired:
+            print(f"[CLIP] Copy timed out after {copy_timeout}s (proxy too slow) — rotating proxy")
+            return False
         ok = r_copy.returncode == 0 and raw_path.exists() and raw_path.stat().st_size > 20_000
         if not ok:
             print(f"[CLIP] Fast copy attempt failed: {(r_copy.stderr or '')[-220:]}")
         return ok
 
-    # Signed YouTube URLs expire and transient failures happen -> retry a few times.
-    for attempt in range(1, 4):
+    # Signed YouTube URLs expire and transient failures happen -> retry a few times,
+    # rotating to the next free proxy and stepping the quality down if needed.
+    total_attempts = len(attempt_heights)
+    for attempt, h_try in enumerate(attempt_heights, start=1):
+        if attempt > 1 and not PROXY_URL:
+            nxt = _rotate_free_proxy()
+            print(f"[CLIP] Rotating to next free proxy: {nxt or '(none left)'}")
         try:
-            if _fast_copy_once():
+            if _fast_copy_once(h_try):
                 downloaded_raw = True
                 break
         except Exception as exc:
             print(f"[CLIP] Fast copy attempt {attempt} error: {exc}")
-        if attempt < 3:
-            print(f"[CLIP] Retrying fast copy ({attempt}/3) with a fresh URL...")
+        if attempt < total_attempts:
+            print(f"[CLIP] Retrying fast copy ({attempt}/{total_attempts}) at {attempt_heights[attempt]}p...")
             time.sleep(1.0 * attempt)
 
     if not downloaded_raw:
@@ -1365,8 +1639,8 @@ def cut_youtube_section(
         # (2-3 GB -> hours) which is what used to freeze the page on "Cutting...".
         _p("Fast path failed — trying a safer fallback download...")
         fallback_fmt = (
-            f"best[height<={MAX_HEIGHT}][ext=mp4][protocol^=http]/"
-            f"best[height<={MAX_HEIGHT}][ext=mp4]/best[ext=mp4]/best"
+            f"best[height<={480}][ext=mp4][protocol^=http]/"
+            f"best[height<={480}][ext=mp4]/best[ext=mp4]/best"
         )
         ydl_opts = {
             "format": fallback_fmt,
@@ -1392,8 +1666,8 @@ def cut_youtube_section(
             ass_path.unlink(missing_ok=True)
             raise RuntimeError(
                 "Could not download this clip section from YouTube. "
-                "The server was blocked or the PROXY_URL is failing — "
-                "check Render logs / renew your residential proxy. "
+                "The server was blocked or the proxy is failing — "
+                "open Settings → Free Proxy Pool → Refresh, or set your own PROXY_URL. "
                 f"(detail: {str(exc)[:180]})"
             )
         if not raw_path.exists() or raw_path.stat().st_size < 20_000:
@@ -1627,11 +1901,15 @@ class CutClipRequest(BaseModel):
 
 
 def _test_proxy() -> dict[str, Any]:
-    """Live proxy check: does PROXY_URL actually authenticate and reach the internet?"""
-    if not PROXY_URL:
-        return {"ok": False, "detail": "PROXY_URL is not set."}
+    """Live proxy check on whichever proxy is currently in use (paid or free pool)."""
+    _p = get_active_proxy()
+    if not _p:
+        return {
+            "ok": False,
+            "detail": "No proxy available yet. The free pool may still be testing — check /api/proxy/pool.",
+        }
     try:
-        with httpx.Client(proxy=PROXY_URL, timeout=12, follow_redirects=True) as client:
+        with httpx.Client(proxy=_p, timeout=12, follow_redirects=True) as client:
             res = client.get("https://ipinfo.io/json")
         data = res.json()
         return {
@@ -1643,6 +1921,123 @@ def _test_proxy() -> dict[str, Any]:
         }
     except Exception as exc:
         return {"ok": False, "detail": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+
+def _mask_proxy(url: str) -> str:
+    """Hide credentials when echoing a proxy back to the browser."""
+    try:
+        parts = urllib.parse.urlsplit(url if "://" in url else f"http://{url}")
+        if parts.username or parts.password:
+            netloc = f"{parts.hostname}:{parts.port or ''}"
+            return f"{parts.scheme}://***:***@{netloc}"
+    except Exception:
+        pass
+    return url if len(url) < 24 else url[:12] + "..."
+
+
+class ProxyCheckRequest(BaseModel):
+    proxy_url: str | None = None
+
+
+@app.post("/api/proxy/check")
+def proxy_check(body: ProxyCheckRequest, user: dict[str, Any] = Depends(get_current_user)):
+    """Test ANY proxy line against ipinfo + YouTube, right from the app.
+    Accepts http://user:pass@host:port, host:port:user:pass, or user:pass@host:port."""
+    candidate = (body.proxy_url or PROXY_URL or "").strip()
+    if not candidate:
+        return {"ok": False, "detail": "No proxy given and PROXY_URL is not set."}
+
+    # Normalise host:port:user:pass or user:pass@host:port into a URL
+    if "://" not in candidate:
+        bits = candidate.split(":")
+        if len(bits) == 4 and not candidate.count("@"):
+            host, port, usr, pwd = bits
+            candidate = f"http://{urllib.parse.quote(usr, safe='')}:{urllib.parse.quote(pwd, safe='')}@{host}:{port}"
+        else:
+            candidate = "http://" + candidate
+
+    out: dict[str, Any] = {
+        "proxy": _mask_proxy(candidate),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "ipinfo": {"ok": False, "detail": "not run"},
+        "youtube": {"ok": False, "detail": "not run"},
+    }
+
+    try:
+        with httpx.Client(proxy=candidate, timeout=15, follow_redirects=True) as client:
+            res = client.get("https://ipinfo.io/json")
+        data = res.json()
+        out["ipinfo"] = {
+            "ok": res.status_code == 200,
+            "status_code": res.status_code,
+            "exit_ip": data.get("ip"),
+            "country": data.get("country"),
+            "city": data.get("city"),
+            "org": data.get("org"),
+        }
+    except Exception as exc:
+        out["ipinfo"] = {"ok": False, "detail": f"{type(exc).__name__}: {str(exc)[:160]}"}
+
+    try:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "socket_timeout": 20,
+            "proxy": candidate,
+            "source_address": "0.0.0.0",
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info("https://www.youtube.com/watch?v=Dz0naoD1QWo", download=False)
+        out["youtube"] = {
+            "ok": True,
+            "formats": len(info.get("formats") or []),
+            "title": (info.get("title") or "")[:60],
+        }
+    except Exception as exc:
+        out["youtube"] = {"ok": False, "detail": str(exc)[:200]}
+
+    out["ok"] = bool(out["ipinfo"].get("ok") and out["youtube"].get("ok"))
+    print(f"[PROXY CHECK] ok={out['ok']} ipinfo={out['ipinfo'].get('ok')} youtube={out['youtube'].get('ok')}")
+    return out
+
+
+@app.get("/api/proxy/pool")
+def proxy_pool_status():
+    with POOL_LOCK:
+        proxies = list(PROXY_POOL.get("proxies") or [])
+        snapshot = {
+            "enabled": FREE_POOL_ENABLED and not bool(PROXY_URL),
+            "status": PROXY_POOL.get("status"),
+            "working": len(proxies),
+            "proxies": proxies,
+            "candidates": PROXY_POOL.get("candidates"),
+            "reachable": PROXY_POOL.get("reachable"),
+            "updated_at": PROXY_POOL.get("updated_at"),
+            "age_sec": int(time.time() - float(PROXY_POOL.get("updated_at") or 0)),
+            "last_error": PROXY_POOL.get("last_error"),
+            "paid_proxy_set": bool(PROXY_URL),
+        }
+    return snapshot
+
+
+@app.post("/api/proxy/pool/refresh")
+def proxy_pool_refresh(user: dict[str, Any] = Depends(get_current_user)):
+    if PROXY_POOL.get("status") == "testing":
+        return {"status": "already testing", "message": "A refresh is already running (10-60s)."}
+    threading.Thread(target=refresh_free_pool, daemon=True).start()
+    return {
+        "status": "started",
+        "message": "Searching free proxy lists and testing them against YouTube. Takes 20-90 seconds.",
+    }
+
+
+@app.on_event("startup")
+def _start_proxy_pool() -> None:
+    _pool_load()
+    if FREE_POOL_ENABLED and not PROXY_URL:
+        threading.Thread(target=_pool_keeper, daemon=True).start()
+        print("[FREE POOL] keeper started (auto-discovers free proxies every 30 min)")
 
 
 @app.get("/api/health")
@@ -1659,9 +2054,22 @@ def health(proxy: int = 0):
         "youtube_cookies_count": YOUTUBE_COOKIES_COUNT,
         "youtube_auth_cookies_ok": YOUTUBE_AUTH_COOKIES_OK,
         "proxy_configured": bool(PROXY_URL),
+        "active_proxy": _mask_proxy(get_active_proxy()) if get_active_proxy() else None,
+        "free_proxy_pool": {
+            "enabled": FREE_POOL_ENABLED and not bool(PROXY_URL),
+            "status": PROXY_POOL.get("status"),
+            "working": len(PROXY_POOL.get("proxies") or []),
+            "candidates": PROXY_POOL.get("candidates"),
+            "reachable": PROXY_POOL.get("reachable"),
+            "age_sec": int(time.time() - float(PROXY_POOL.get("updated_at") or 0)),
+            "last_error": PROXY_POOL.get("last_error"),
+        },
         "encode_preset": ENCODE_PRESET,
         "encode_crf": ENCODE_CRF,
         "low_cpu_mode": LOW_CPU,
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "disk_free_mb": round(_free_mb(), 1),
+        "build": BUILD_TAG,
     }
     if proxy:
         payload["proxy_test"] = _test_proxy()
@@ -2005,7 +2413,11 @@ def analyze_video(body: AnalyzeRequest, user: dict[str, Any] = Depends(get_curre
     except Exception as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not read YouTube transcript: {str(exc)[:240]}",
+            detail=(
+                "YouTube links need a working residential proxy, which is unreliable on free hosting. "
+                "Use the Upload Video (MP4) button instead — it is 100% free and never blocked. "
+                f"(details: {str(exc)[:160]})"
+            ),
         )
 
     meta = fetch_video_metadata(url, video_id)
@@ -2068,13 +2480,41 @@ def analyze_video(body: AnalyzeRequest, user: dict[str, Any] = Depends(get_curre
 
 
 def probe_local_duration(video_path: Path) -> float:
-    if not FFMPEG_BIN:
+    """Duration via header scan, then fall back to a real decode if the header is missing."""
+    if not FFMPEG_BIN or not video_path.exists():
         return 0.0
-    res = subprocess.run([FFMPEG_BIN, "-i", str(video_path)], capture_output=True, text=True, timeout=30)
-    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr or "")
-    if not m:
-        return 0.0
-    return round(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)), 2)
+    try:
+        res = subprocess.run(
+            [FFMPEG_BIN, "-i", str(video_path)], capture_output=True, text=True, timeout=60
+        )
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr or "")
+        if m:
+            dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            if dur > 0:
+                return round(dur, 2)
+    except Exception as exc:
+        print(f"[PROBE] header scan failed: {exc}")
+
+    # Header missing (common with some MKV/WebM streams) -> decode and read the last pts.
+    try:
+        res = subprocess.run(
+            [
+                FFMPEG_BIN, "-i", str(video_path), "-map", "0:v:0?",
+                "-f", "null", "-benchmark", "-",
+            ],
+            capture_output=True, text=True, timeout=300,
+        )
+        text = (res.stderr or "")
+        times = [float(t) for t in re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", text) for t in [t]]
+        matches = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+        if matches:
+            h, mm, ss = matches[-1]
+            dur = int(h) * 3600 + int(mm) * 60 + float(ss)
+            if dur > 0:
+                return round(dur, 2)
+    except Exception as exc:
+        print(f"[PROBE] decode scan failed: {exc}")
+    return 0.0
 
 
 def detect_uploaded_video_moments(
@@ -2093,15 +2533,24 @@ def detect_uploaded_video_moments(
 
     energy: list[float] = []
     if FFMPEG_BIN:
-        res = subprocess.run(
-            [
+        # Analyze at most the first ~25 minutes, mono 8 kHz -> fast even on 0.1 CPU.
+        analyze_cap = min(float(duration), 25 * 60.0)
+        try:
+            res = subprocess.run(
+                [
                 FFMPEG_BIN, "-i", str(video_path), "-vn",
+                "-t", f"{analyze_cap:.1f}",
+                "-ac", "1", "-ar", "8000",
                 "-af", "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
                 "-f", "null", "-",
             ],
-            capture_output=True, text=True, timeout=60,
-        )
-        raw = (res.stdout or "") + "\n" + (res.stderr or "")
+                capture_output=True, text=True, timeout=240,
+            )
+            raw = (res.stdout or "") + "\n" + (res.stderr or "")
+        except Exception as exc:
+            # Video without an audio track, or the scan timed out -> synthetic energy curve.
+            print(f"[ANALYZE] audio scan skipped ({exc}); using adaptive fallback")
+            raw = ""
         buckets: list[list[float]] = [[] for _ in range(num_buckets)]
         cur_t = 0.0
         for line in raw.splitlines():
@@ -2174,40 +2623,162 @@ def detect_uploaded_video_moments(
     return selected
 
 
-def cut_uploaded_section(source_path: Path, video_id: str, start: float, end: float) -> tuple[Path, bool, str | None]:
+def _guess_lang(transcript: list[dict[str, Any]]) -> str:
+    """Cheap language guess: Devanagari characters => Hindi."""
+    sample = " ".join(str(s.get("text", "")) for s in transcript[:250])
+    if re.search(r"[\u0900-\u097F]", sample):
+        return "hi"
+    return "en"
+
+
+SUBS_TS_RE = re.compile(
+    r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})"
+)
+
+
+def parse_subtitles(raw: str) -> list[dict[str, Any]]:
+    """Parse .srt / .vtt text into [{'start','duration','text'}] segments."""
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    segs: list[dict[str, Any]] = []
+    i = 0
+    while i < len(lines):
+        m = SUBS_TS_RE.search(lines[i])
+        if not m:
+            i += 1
+            continue
+        start = (
+            int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+            + int(m.group(4).ljust(3, "0")) / 1000
+        )
+        end = (
+            int(m.group(5)) * 3600 + int(m.group(6)) * 60 + int(m.group(7))
+            + int(m.group(8).ljust(3, "0")) / 1000
+        )
+        i += 1
+        buf: list[str] = []
+        while i < len(lines) and lines[i].strip() and not SUBS_TS_RE.search(lines[i]):
+            txt = re.sub(r"<[^>]+>", "", lines[i])
+            txt = re.sub(r"\{[^}]*\}", "", txt).strip()
+            if txt:
+                buf.append(txt)
+            i += 1
+        text = " ".join(buf).strip()
+        if text and end > start:
+            segs.append({"start": round(start, 3), "duration": round(end - start, 3), "text": text})
+    return segs
+
+
+def cut_uploaded_section(
+    source_path: Path,
+    video_id: str,
+    start: float,
+    end: float,
+    transcript: list[dict[str, Any]] | None = None,
+    with_captions: bool = True,
+    caption_theme: str = "gold",
+    progress: Any = None,
+) -> tuple[Path, bool, str | None]:
+    """Cuts a clip from an UPLOADED file and can burn captions from an uploaded .srt/.vtt."""
     if not FFMPEG_BIN or not source_path.exists():
         raise RuntimeError("Uploaded source video not found on server.")
+
+    def _p(msg: str) -> None:
+        if callable(progress):
+            try:
+                progress(msg)
+            except Exception:
+                pass
+
     start_i = max(0, int(math.floor(start)))
     end_i = max(start_i + 3, int(math.ceil(end)))
-    tag = f"{video_id}_{start_i}_{end_i}_{MAX_HEIGHT}p_v3"
+    transcript = transcript or []
+    want_cc = bool(with_captions and CAPTIONS and transcript)
+    theme_slug = caption_theme if caption_theme in CAPTION_THEMES else "gold"
+    tag = f"{video_id}_{start_i}_{end_i}_{MAX_HEIGHT}p_{theme_slug}_v3"
     raw_path = CLIPS_DIR / f"{tag}_raw.mp4"
-    final_path = CLIPS_DIR / f"{tag}.mp4"
+    final_path = CLIPS_DIR / (f"{tag}_cc.mp4" if want_cc else f"{tag}.mp4")
     if final_path.exists() and final_path.stat().st_size > 10_000:
-        return final_path, False, None
+        print(f"[CLIP] Serving cached clip: {final_path.name}")
+        return final_path, want_cc, None
 
+    ass_path = CLIPS_DIR / f"{tag}.ass"
+    has_ass, used_font_file = (
+        build_synced_ass(transcript, start, end, ass_path, theme_key=theme_slug)
+        if want_cc
+        else (False, None)
+    )
+
+    _p("Cutting section from your uploaded video...")
     subprocess.run(
         [
             FFMPEG_BIN, "-y",
-            "-ss", f"{start:.2f}",
+            "-ss", f"{max(0.0, start - 0.3):.2f}",
             "-i", str(source_path),
-            "-t", f"{max(2.0, end - start):.2f}",
+            "-t", f"{max(2.0, end - start) + 0.6:.2f}",
             "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
             str(raw_path),
         ],
-        capture_output=True, timeout=90, check=True,
+        capture_output=True, timeout=150, check=True,
     )
-    ok, err = encode_smooth_clip(raw_path, final_path)
+
+    _p(f"Encoding {MAX_HEIGHT}p 30fps" + (" + burning captions" if has_ass else "") + "...")
+    caption_note: str | None = None
+    if has_ass:
+        ok, _err = encode_smooth_clip(raw_path, final_path, ass_path=ass_path, font_file=used_font_file)
+        ass_path.unlink(missing_ok=True)
+        if ok:
+            raw_path.unlink(missing_ok=True)
+            return final_path, True, None
+        caption_note = "Clip saved without captions (FFmpeg caption burn failed)."
+    else:
+        ass_path.unlink(missing_ok=True)
+
+    plain_path = CLIPS_DIR / f"{tag}.mp4"
+    ok2, err2 = encode_smooth_clip(raw_path, plain_path)
     raw_path.unlink(missing_ok=True)
-    if not ok:
-        raise RuntimeError(f"Failed encoding uploaded clip: {err[-200:]}")
-    return final_path, False, None
+    if not ok2:
+        raise RuntimeError(f"Failed encoding uploaded clip: {err2[-200:]}")
+    return plain_path, False, caption_note
+
+
+def _free_mb() -> float:
+    try:
+        return shutil.disk_usage(str(DATA_DIR)).free / (1024 * 1024)
+    except Exception:
+        return -1.0
+
+
+def _make_room(need_mb: float) -> bool:
+    """Delete old clips/uploads until `need_mb` fits (Render's disk is tiny)."""
+    keep = 180.0
+    if _free_mb() < 0:
+        return True
+    if _free_mb() >= need_mb + keep // 2:
+        return True
+    candidates = sorted(
+        [p for p in list(CLIPS_DIR.glob("*.mp4")) + list(UPLOADS_DIR.glob("*")) if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+    )
+    for path in candidates:
+        if _free_mb() >= need_mb + 60:
+            return True
+        try:
+            path.unlink(missing_ok=True)
+            print(f"[DISK] Removed old file to make room: {path.name}")
+        except Exception:
+            pass
+    return _free_mb() >= need_mb + 30
 
 
 @app.post("/api/upload")
 async def upload_video(
     file: UploadFile = File(...),
+    subs: UploadFile | None = File(None),
     clip_length: int = Form(30),
     max_clips: int = Form(5),
+    sync: int = 0,
+    job: int = 0,
     user: dict[str, Any] = Depends(get_current_user),
 ):
     """Upload any MP4/MOV/WebM/MKV directly — works 100% on Render with ZERO YouTube IP blocks!"""
@@ -2219,57 +2790,67 @@ async def upload_video(
     clip_length = clip_length if clip_length in (30, 45, 60) else 30
     max_clips = max_clips if max_clips in (5, 10, 20) else 5
 
+    if not _make_room(float(MAX_UPLOAD_MB)):
+        raise HTTPException(
+            status_code=507,
+            detail="The server is out of free disk space. Delete a few saved clips/projects and try again.",
+        )
+
     vid_id = f"up_{secrets.token_hex(5)}"
     saved_path = UPLOADS_DIR / f"{vid_id}{ext}"
+    total_bytes = 0
     with saved_path.open("wb") as out_f:
         while True:
             chunk = await file.read(1024 * 1024)
             if not chunk:
                 break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_UPLOAD_MB * 1024 * 1024:
+                out_f.close()
+                saved_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"That file is bigger than {MAX_UPLOAD_MB} MB, which the free server can't accept. "
+                        "Fix: download it in 360p/720p (y2mate lets you pick), or cut it into a shorter "
+                        "piece first — clips are only 30-60s anyway."
+                    ),
+                )
             out_f.write(chunk)
 
-    duration = probe_local_duration(saved_path)
-    if duration <= 2:
-        saved_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail="Could not read video duration. Ensure the file is a valid video.")
+    # Optional .srt / .vtt subtitles -> real synced captions for uploaded videos!
+    transcript: list[dict[str, Any]] = []
+    if subs is not None and subs.filename:
+        try:
+            raw_subs = (await subs.read()).decode("utf-8", errors="ignore")
+            transcript = parse_subtitles(raw_subs)
+            print(f"[UPLOAD] Parsed {len(transcript)} subtitle segments from {subs.filename}")
+        except Exception as exc:
+            print(f"[UPLOAD] Subtitle parse failed: {exc}")
 
-    clean_title = Path(orig_name).stem.replace("_", " ").replace("-", " ").strip() or "Uploaded Video"
-    suggestions = detect_uploaded_video_moments(saved_path, duration, clip_length, max_clips, clean_title)
-    if not suggestions:
-        raise HTTPException(status_code=400, detail="Video is too short to generate clips.")
 
-    top_score = max(s["score"] for s in suggestions)
-    now = datetime.now(timezone.utc).isoformat()
-    src_url = f"upload://{saved_path.name}"
+    # Non-job callers (older frontends) get the classic immediate response.
+    if sync or not job:
+        try:
+            project = _perform_upload(
+                user, saved_path, orig_name, clip_length, max_clips, transcript
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"project": project}
 
-    with get_db() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO projects (user_id, video_id, url, title, thumbnail, duration, language, top_score, clip_length, max_clips, suggestions_json, transcript_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user["id"], vid_id, src_url, clean_title, None, duration, "auto",
-                top_score, clip_length, max_clips, json.dumps(suggestions), "[]", now,
-            ),
-        )
-        proj_id = cur.lastrowid
-
+    # Heavy audio analysis runs in a BACKGROUND JOB (0.1 CPU can take a while).
+    job_id = _job_create(kind="upload")
+    threading.Thread(
+        target=_run_upload_job,
+        args=(job_id, user, saved_path, orig_name, clip_length, max_clips, transcript),
+        daemon=True,
+    ).start()
     return {
-        "project": {
-            "id": proj_id,
-            "video_id": vid_id,
-            "url": src_url,
-            "title": clean_title,
-            "thumbnail": None,
-            "duration": duration,
-            "language": "auto",
-            "top_score": top_score,
-            "clip_length": clip_length,
-            "max_clips": max_clips,
-            "suggestions": suggestions,
-            "created_at": now,
-        }
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Upload received — analysing audio for viral moments...",
+        "poll_url": f"/api/clips/job/{job_id}",
     }
 
 
@@ -2287,7 +2868,7 @@ CUT_JOBS_LOCK = threading.Lock()
 CUT_JOB_TTL = 60 * 60  # keep finished jobs around for 1 hour
 
 
-def _job_create() -> str:
+def _job_create(kind: str = "cut", message: str = "Queued...") -> str:
     job_id = secrets.token_hex(8)
     now = time.time()
     with CUT_JOBS_LOCK:
@@ -2297,11 +2878,13 @@ def _job_create() -> str:
             CUT_JOBS.pop(stale, None)
         CUT_JOBS[job_id] = {
             "id": job_id,
+            "kind": kind,
             "status": "queued",
-            "message": "Queued...",
+            "message": message,
             "started_at": now,
             "updated_at": now,
             "clip": None,
+            "project": None,
             "note": None,
             "error": None,
         }
@@ -2339,6 +2922,10 @@ def _perform_cut(
                 proj["video_id"],
                 body.start,
                 body.end,
+                transcript=transcript,
+                with_captions=body.captions,
+                caption_theme=body.caption_theme,
+                progress=progress,
             )
         else:
             out_path, has_cc, note = cut_youtube_section(
@@ -2430,9 +3017,111 @@ def _run_cut_job(job_id: str, body: "CutClipRequest", user: dict[str, Any], proj
         )
 
 
+def _perform_upload(
+    user: dict[str, Any],
+    saved_path: Path,
+    orig_name: str,
+    clip_length: int,
+    max_clips: int,
+    transcript: list[dict[str, Any]],
+    progress: Any = None,
+) -> dict[str, Any]:
+    """Analyse an uploaded video and create the project. Returns the project dict."""
+    def _p(msg: str) -> None:
+        if callable(progress):
+            try:
+                progress(msg)
+            except Exception:
+                pass
+
+    _p("Reading video duration...")
+    duration = probe_local_duration(saved_path)
+    if duration <= 2:
+        saved_path.unlink(missing_ok=True)
+        raise RuntimeError("Could not read the video duration — is the file a valid MP4/MOV?")
+
+    _p(f"Analysing {duration/60:.1f} min of audio for high-energy moments...")
+    clean_title = (
+        Path(orig_name).stem.replace("_", " ").replace("-", " ").strip() or "Uploaded Video"
+    )
+    suggestions = detect_uploaded_video_moments(
+        saved_path, duration, clip_length, max_clips, clean_title
+    )
+    if not suggestions:
+        raise RuntimeError("Video is too short to generate clips (need at least ~5 seconds).")
+
+    top_score = max(s["score"] for s in suggestions)
+    now = datetime.now(timezone.utc).isoformat()
+    src_url = f"upload://{saved_path.name}"
+    lang = "auto" if not transcript else _guess_lang(transcript)
+
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO projects (user_id, video_id, url, title, thumbnail, duration, language, top_score, clip_length, max_clips, suggestions_json, transcript_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"], saved_path.stem, src_url, clean_title, None, duration, lang,
+                top_score, clip_length, max_clips, json.dumps(suggestions),
+                json.dumps(transcript), now,
+            ),
+        )
+        proj_id = cur.lastrowid
+
+    return {
+        "id": proj_id,
+        "video_id": saved_path.stem,
+        "url": src_url,
+        "title": clean_title,
+        "thumbnail": None,
+        "duration": duration,
+        "language": lang,
+        "top_score": top_score,
+        "clip_length": clip_length,
+        "max_clips": max_clips,
+        "suggestions": suggestions,
+        "captions_available": bool(transcript),
+        "caption_segments": len(transcript),
+        "created_at": now,
+    }
+
+
+def _run_upload_job(
+    job_id: str,
+    user: dict[str, Any],
+    saved_path: Path,
+    orig_name: str,
+    clip_length: int,
+    max_clips: int,
+    transcript: list[dict[str, Any]],
+) -> None:
+    """Analyse an uploaded video for viral moments in the background."""
+    try:
+        _job_update(job_id, status="running", message="Reading video duration...")
+        project = _perform_upload(
+            user, saved_path, orig_name, clip_length, max_clips, transcript,
+            progress=lambda msg: _job_update(job_id, message=msg),
+        )
+        _job_update(job_id, status="done", message="Analysis ready!", project=project,
+                    finished_at=time.time())
+    except Exception as exc:  # noqa: BLE001
+        print(f"[UPLOAD JOB {job_id}] FAILED: {exc}")
+        _job_update(job_id, status="error", message="Upload analysis failed.",
+                    error=str(exc) or "Unknown error while analysing the video.",
+                    finished_at=time.time())
+        return
+
+
+
 @app.post("/api/clips/cut")
-def cut_clip(body: CutClipRequest, user: dict[str, Any] = Depends(get_current_user)):
-    """Starts a background cut job and returns immediately with a job id."""
+def cut_clip(
+    body: CutClipRequest,
+    sync: int = 0,
+    job: int = 0,
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    """Starts a background cut job and returns immediately with a job id (or runs sync)."""
     with get_db() as conn:
         proj = conn.execute(
             "SELECT * FROM projects WHERE id = ? AND user_id = ?",
@@ -2440,6 +3129,15 @@ def cut_clip(body: CutClipRequest, user: dict[str, Any] = Depends(get_current_us
         ).fetchone()
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found.")
+
+    if sync or not job:
+        try:
+            clip, note = _perform_cut(body, user, dict(proj))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        return {"clip": clip, "note": note}
 
     job_id = _job_create()
     threading.Thread(
@@ -2494,7 +3192,19 @@ def delete_clip(clip_id: int, user: dict[str, Any] = Depends(get_current_user)):
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: int, user: dict[str, Any] = Depends(get_current_user)):
     with get_db() as conn:
+        row = conn.execute(
+            "SELECT url FROM projects WHERE id = ? AND user_id = ?",
+            (project_id, user["id"]),
+        ).fetchone()
         conn.execute("DELETE FROM projects WHERE id = ? AND user_id = ?", (project_id, user["id"]))
+        # Free the disk: remove the uploaded source video too (Render's disk is tiny).
+        if row and str(row["url"]).startswith("upload://"):
+            fname = str(row["url"]).replace("upload://", "", 1)
+            still_used = conn.execute(
+                "SELECT 1 FROM projects WHERE url = ? LIMIT 1", (row["url"],)
+            ).fetchone()
+            if not still_used:
+                (UPLOADS_DIR / Path(fname).name).unlink(missing_ok=True)
     return {"deleted": True}
 
 
@@ -2504,9 +3214,10 @@ def serve_clip_file(filename: str, download: int = 0):
     path = CLIPS_DIR / safe_name
     if not path.exists():
         raise HTTPException(status_code=404, detail="Clip file not found.")
+    headers = {}
     if download:
-        return FileResponse(path, media_type="video/mp4", filename=safe_name)
-    return FileResponse(path, media_type="video/mp4")
+        headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    return FileResponse(path, media_type="video/mp4", headers=headers)
 
 
 # ---------- SERVE BUILT REACT FRONTEND IN PRODUCTION ----------

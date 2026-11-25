@@ -434,6 +434,10 @@ export default function App() {
   const [captionTheme, setCaptionTheme] = useState("gold");
   const [selectedTemplate, setSelectedTemplate] = useState("Premium Gold CC");
   const [copiedKey, setCopiedKey] = useState("");
+  const [subsFile, setSubsFile] = useState(null);   // optional .srt / .vtt for uploaded videos
+  const [proxyInput, setProxyInput] = useState("");
+  const [proxyResult, setProxyResult] = useState(null);
+  const [proxyTesting, setProxyTesting] = useState(false);
 
   const [stats, setStats] = useState({
     projects_count: 0,
@@ -450,6 +454,8 @@ export default function App() {
   const [analyzeSuccess, setAnalyzeSuccess] = useState("");
 
   const [cuttingKey, setCuttingKey] = useState(null);
+  const [downloadingId, setDownloadingId] = useState(null);
+  const [downloadPct, setDownloadPct] = useState(0);
   const [clipStatus, setClipStatus] = useState({ type: "", text: "" });
   const [previewClip, setPreviewClip] = useState(null);
   const [health, setHealth] = useState(null);
@@ -597,6 +603,16 @@ export default function App() {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
+
+    const limitMb = health?.max_upload_mb || 95;
+    const sizeMb = file.size / (1024 * 1024);
+    if (sizeMb > limitMb) {
+      setAnalyzeError(
+        `"${file.name}" is ${sizeMb.toFixed(0)} MB but the limit is ${limitMb} MB. ` +
+          `Fix: download the video in 360p or 720p (much smaller), or cut out just the part you need first.`
+      );
+      return;
+    }
     setAnalyzing(true);
     setAnalyzeError("");
     setAnalyzeSuccess("");
@@ -604,17 +620,48 @@ export default function App() {
     try {
       const form = new FormData();
       form.append("file", file);
+      if (subsFile) form.append("subs", subsFile);
       form.append("clip_length", String(clipLength));
       form.append("max_clips", String(maxClips));
-      const data = await apiFetch("/upload", {
+      const data = await apiFetch("/upload?job=1", {
         method: "POST",
         body: form,
       });
-      const proj = data.project;
+
+      // Upload now returns a job id — poll it so slow free-tier CPUs never time out.
+      let proj = data.project;
+      if (!proj) {
+        const jobId = data.job_id;
+        const startedAt = Date.now();
+        let job = data;
+        while (job.status !== "done" && job.status !== "error") {
+          if (Date.now() - startedAt > 20 * 60 * 1000) {
+            throw new Error("Analysis took over 20 minutes. Try a shorter video (under ~10 min).");
+          }
+          await new Promise((r) => setTimeout(r, 2500));
+          job = await apiFetch(`/clips/job/${jobId}`);
+          const elapsed = Math.round((Date.now() - startedAt) / 1000);
+          setClipStatus({
+            type: "info",
+            text: `${job.message || "Analysing video..."} (${elapsed}s) — keep this tab open.`,
+          });
+        }
+        if (job.status === "error") {
+          throw new Error(job.error || "Upload analysis failed.");
+        }
+        proj = job.project;
+      }
+
       setSelectedProjectId(proj.id);
       setAnalyzeSuccess(
-        `Uploaded "${proj.title}" and found ${proj.suggestions.length} high-energy ${proj.clip_length}s clips! Click "Cut & Download" on any clip below.`
+        `Uploaded "${proj.title}" and found ${proj.suggestions.length} high-energy ${proj.clip_length}s clips! ` +
+          (proj.captions_available
+            ? `Captions loaded (${proj.caption_segments} lines) — clips will have ${captionTheme} CC. `
+            : "No .srt attached, so clips will be exported without captions. ") +
+          'Click "Cut & Download" below.'
       );
+      setSubsFile(null);
+      setClipStatus({ type: "", text: "" });
       await loadWorkspace();
       setActiveTab("dashboard");
     } catch (err) {
@@ -656,7 +703,7 @@ export default function App() {
 
     try {
       // 1) Start the background job (returns instantly)
-      const startData = await apiFetch("/clips/cut", {
+      const startData = await apiFetch("/clips/cut?job=1", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -706,17 +753,55 @@ export default function App() {
           : `Clip saved to My Clips (${clip.quality}${clip.has_captions ? " + CC" : ""})! Downloading now...`,
       });
 
-      // 3) Trigger browser file download
-      const a = document.createElement("a");
-      a.href = clip.download_url;
-      a.download = clip.filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      // 3) Trigger browser file download (blob download = works even on slow servers)
+      await downloadClip(clip);
     } catch (err) {
       setClipStatus({ type: "error", text: err.message });
     } finally {
       setCuttingKey(null);
+    }
+  }
+
+  async function downloadClip(clip) {
+    if (!clip?.download_url) return;
+    if (downloadingId) return;
+    setDownloadingId(clip.id ?? clip.filename);
+    setDownloadPct(0);
+    try {
+      const res = await fetch(`${API_BASE}/clips/file/${encodeURIComponent(clip.filename)}?download=1`);
+      if (!res.ok) throw new Error(`Download failed (HTTP ${res.status}). Try again in a moment.`);
+      const total = Number(res.headers.get("content-length") || 0);
+      let blob;
+      if (res.body && res.body.getReader) {
+        const reader = res.body.getReader();
+        const chunks = [];
+        let received = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          if (total) setDownloadPct(Math.min(99, Math.round((received / total) * 100)));
+        }
+        blob = new Blob(chunks, { type: "video/mp4" });
+      } else {
+        blob = await res.blob();
+      }
+      setDownloadPct(100);
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objectUrl;
+      a.download = clip.filename || "clip.mp4";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 120000);
+      setClipStatus({ type: "success", text: `Downloaded ${clip.filename} (${(blob.size / 1048576).toFixed(1)} MB)` });
+    } catch (err) {
+      setClipStatus({ type: "error", text: err.message });
+    } finally {
+      setDownloadingId(null);
+      setDownloadPct(0);
     }
   }
 
@@ -909,30 +994,51 @@ export default function App() {
                 <span>viral moments.</span>
               </h1>
               <p>
-                Paste a YouTube link to discover high-scoring moments — then click{" "}
-                <strong>Cut &amp; Download</strong> only on the clips you actually want.
+                Upload your video — we find the highest-scoring moments, burn styled captions, and
+                write a viral title, description &amp; hashtags for every clip.
               </p>
 
-              <form className="url-box" onSubmit={handleAnalyze}>
-                <LinkIcon size={18} className="url-icon" />
+              {/* Upload-only flow: no YouTube link required. */}
+              <label
+                style={{
+                  marginTop: 22,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 6,
+                  width: "100%",
+                  padding: "28px 22px",
+                  borderRadius: 18,
+                  border: "1.5px dashed rgba(139, 92, 246, 0.55)",
+                  background:
+                    "linear-gradient(180deg, rgba(139, 92, 246, 0.16), rgba(139, 92, 246, 0.04))",
+                  cursor: analyzing ? "not-allowed" : "pointer",
+                  opacity: analyzing ? 0.7 : 1,
+                  textAlign: "center",
+                  boxSizing: "border-box",
+                }}
+              >
+                {analyzing ? (
+                  <Loader2 size={26} className="spin" style={{ color: "#c4b5fd" }} />
+                ) : (
+                  <Upload size={26} style={{ color: "#c4b5fd" }} />
+                )}
+                <strong style={{ fontSize: 17 }}>
+                  {analyzing ? "Processing your video…" : "Upload Video (MP4)"}
+                </strong>
+                <span style={{ fontSize: 12.5, color: "#9b9bb4" }}>
+                  MP4 · MOV · MKV · WEBM — up to {health?.max_upload_mb || 95} MB · 360p or 720p
+                  uploads are fastest
+                </span>
                 <input
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  placeholder="Paste YouTube URL (e.g. https://www.youtube.com/watch?v=...)"
+                  type="file"
+                  accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv"
+                  onChange={handleUploadVideo}
                   disabled={analyzing}
+                  hidden
                 />
-                <button type="submit" className="primary-btn" disabled={analyzing}>
-                  {analyzing ? (
-                    <>
-                      <Loader2 size={17} className="spin" /> Analyzing...
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles size={17} /> Generate {maxClips} Clips ({clipLength}s)
-                    </>
-                  )}
-                </button>
-              </form>
+              </label>
 
               <div className="clip-options-bar">
                 <div className="option-group">
@@ -976,19 +1082,38 @@ export default function App() {
 
               <div className="hero-subrow">
                 <small>
-                  Auto-generates Viral Title, Description &amp; Hashtags for every clip · 1080p smooth export
+                  Auto-generates Viral Title, Description &amp; Hashtags · 1080p smooth export · Max upload{" "}
+                  {health?.max_upload_mb || 95} MB · Want burned captions? Choose the{" "}
+                  <strong>.srt</strong> file first, then upload your video
                 </small>
                 <div className="hero-quick-btns">
-                  <label className={`ghost-btn upload-label ${analyzing ? "disabled" : ""}`}>
-                    <Upload size={14} /> Upload Video (MP4)
+                  <label
+                    className={`ghost-btn upload-label ${analyzing ? "disabled" : ""}`}
+                    style={
+                      subsFile
+                        ? {
+                            borderColor: "rgba(74, 239, 134, 0.55)",
+                            color: "#9df7bd",
+                            background: "rgba(74, 239, 134, 0.08)",
+                          }
+                        : undefined
+                    }
+                    title="Optional: add the video's .srt / .vtt subtitle file to burn Hindi/English captions"
+                  >
+                    <Subtitles size={14} />
+                    {subsFile ? `CC ready: ${subsFile.name.slice(0, 18)}` : "Add Subtitles (.srt) — optional"}
                     <input
                       type="file"
-                      accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv"
-                      onChange={handleUploadVideo}
+                      accept=".srt,.vtt,text/plain"
+                      onChange={(e) => {
+                        setSubsFile(e.target.files?.[0] || null);
+                        setAnalyzeError("");
+                      }}
                       disabled={analyzing}
                       hidden
                     />
                   </label>
+
                   <button
                     type="button"
                     className="ghost-btn"
@@ -1054,8 +1179,8 @@ export default function App() {
                         <Film size={40} />
                         <h3>No projects yet</h3>
                         <p>
-                          Paste a YouTube URL above or click <strong>Try Instant Demo Video</strong>{" "}
-                          to analyze your first video.
+                          Click <strong>Upload Video (MP4)</strong> to analyze your first video, or
+                          try the <strong>Instant Demo</strong>.
                         </p>
                       </div>
                     ) : (
@@ -1386,13 +1511,22 @@ export default function App() {
                           {copiedKey === `clip_${clip.id}` ? <Check size={13} /> : <Copy size={13} />}
                           {copiedKey === `clip_${clip.id}` ? "Copied" : "Copy Info"}
                         </button>
-                        <a
-                          href={clip.download_url}
-                          download={clip.filename}
+                        <button
+                          type="button"
                           className="cut-btn small"
+                          onClick={() => downloadClip(clip)}
+                          disabled={downloadingId !== null}
                         >
-                          <Download size={14} /> Download
-                        </a>
+                          {downloadingId === clip.id ? (
+                            <>
+                              <Loader2 size={14} className="spin" /> {downloadPct}%
+                            </>
+                          ) : (
+                            <>
+                              <Download size={14} /> Download
+                            </>
+                          )}
+                        </button>
                         <button
                           className="icon-btn danger"
                           title="Delete clip"
@@ -1625,6 +1759,90 @@ export default function App() {
 
               <div className="panel">
                 <h3>
+                  <ShieldCheck size={18} /> YouTube Proxy Tester
+                </h3>
+                <p style={{ color: "#9aa0b5", fontSize: 13, marginTop: -4 }}>
+                  Paste any residential proxy line and test it here. YouTube-URL clipping only works when this
+                  passes. Formats accepted: <code>http://user:pass@host:port</code>,{" "}
+                  <code>host:port:user:pass</code>, or <code>user:pass@host:port</code>.
+                </p>
+                <div className="field-input" style={{ marginTop: 10 }}>
+                  <LinkIcon size={16} />
+                  <input
+                    value={proxyInput}
+                    onChange={(e) => setProxyInput(e.target.value)}
+                    placeholder="http://customer-xxxx:pass@pr.oxylabs.io:7777"
+                    spellCheck={false}
+                  />
+                </div>
+                <button
+                  className="primary-btn mt-12"
+                  disabled={proxyTesting}
+                  onClick={async () => {
+                    setProxyTesting(true);
+                    setProxyResult(null);
+                    try {
+                      const res = await apiFetch("/proxy/check", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ proxy_url: proxyInput.trim() }),
+                      });
+                      setProxyResult(res);
+                    } catch (err) {
+                      setProxyResult({ ok: false, detail: err.message });
+                    } finally {
+                      setProxyTesting(false);
+                    }
+                  }}
+                >
+                  {proxyTesting ? (
+                    <>
+                      <Loader2 size={16} className="spin" /> Testing (10-30s)...
+                    </>
+                  ) : (
+                    <>
+                      <Zap size={16} /> Test this proxy
+                    </>
+                  )}
+                </button>
+
+                {proxyResult && (
+                  <div className={`alert ${proxyResult.ok ? "success" : "error"} mt-12`}>
+                    {proxyResult.ok ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}
+                    <span>
+                      {proxyResult.ok
+                        ? `WORKS! Exit IP ${proxyResult.ipinfo?.exit_ip} (${proxyResult.ipinfo?.country}) — YouTube returned ${proxyResult.youtube?.formats} formats.`
+                        : `FAILED — ipinfo: ${proxyResult.ipinfo?.ok ? "ok" : proxyResult.ipinfo?.detail || "-"} | YouTube: ${
+                            proxyResult.youtube?.ok
+                              ? "ok"
+                              : String(proxyResult.youtube?.detail || proxyResult.detail || "-").slice(0, 140)
+                          }`}
+                    </span>
+                  </div>
+                )}
+
+                <div className="kv-list mt-16">
+                  <div>
+                    <span>Saved PROXY_URL</span>
+                    <strong>{health?.proxy_configured ? "Configured" : "Not set"}</strong>
+                  </div>
+                  <div>
+                    <span>Upload limit</span>
+                    <strong>{health?.max_upload_mb || 95} MB</strong>
+                  </div>
+                  <div>
+                    <span>Free disk</span>
+                    <strong>{health?.disk_free_mb != null ? `${Math.round(health.disk_free_mb)} MB` : "--"}</strong>
+                  </div>
+                  <div>
+                    <span>Build</span>
+                    <strong>{health?.build || "--"}</strong>
+                  </div>
+                </div>
+              </div>
+
+              <div className="panel">
+                <h3>
                   <ShieldCheck size={18} /> Backend Engine Status
                 </h3>
                 <div className="kv-list">
@@ -1702,13 +1920,22 @@ export default function App() {
                 {copiedKey === `modal_${previewClip.id}` ? <Check size={15} /> : <Copy size={15} />}
                 {copiedKey === `modal_${previewClip.id}` ? "Copied Title, Desc & Tags!" : "Copy Title, Desc & Tags"}
               </button>
-              <a
-                href={previewClip.download_url}
-                download={previewClip.filename}
+              <button
+                type="button"
+                onClick={() => downloadClip(previewClip)}
                 className="primary-btn"
+                disabled={downloadingId !== null}
               >
-                <Download size={16} /> Download MP4
-              </a>
+                {downloadingId === previewClip.id ? (
+                  <>
+                    <Loader2 size={16} className="spin" /> Downloading {downloadPct}%
+                  </>
+                ) : (
+                  <>
+                    <Download size={16} /> Download MP4
+                  </>
+                )}
+              </button>
             </div>
           </div>
         </div>
