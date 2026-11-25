@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 import imageio_ffmpeg
 import yt_dlp
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -69,7 +69,7 @@ SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")  # Paste your 16-char Gma
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
 # Max size for an uploaded video (Render Free disk/RAM are small; keep this sane).
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "95"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1024"))   # 1 GB default
 
 # ============================================================
 # FREE PROXY POOL — auto-discovers free proxies that YouTube accepts.
@@ -311,7 +311,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-25-upload-only"
+BUILD_TAG = "2026-11-25-float-fix"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -763,9 +763,9 @@ def fetch_video_metadata(url: str, video_id: str) -> dict[str, Any]:
 def _parse_vtt_time(ts: str) -> float:
     parts = ts.strip().replace(",", ".").split(":")
     if len(parts) == 3:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        return _safe_float(parts[0]) * 3600 + _safe_float(parts[1]) * 60 + _safe_float(parts[2])
     if len(parts) == 2:
-        return int(parts[0]) * 60 + float(parts[1])
+        return _safe_float(parts[0]) * 60 + _safe_float(parts[1])
     return 0.0
 
 
@@ -982,12 +982,12 @@ def _fetch_transcript_primary_api(video_id: str) -> tuple[list[dict[str, Any]], 
     for s in fetched:
         if isinstance(s, dict):
             text = str(s.get("text", "")).strip()
-            start = float(s.get("start", 0.0))
-            dur = float(s.get("duration", 2.0))
+            start = _safe_float(s.get("start", 0.0))
+            dur = _safe_float(s.get("duration", 2.0), 2.0)
         else:
             text = str(getattr(s, "text", "")).strip()
-            start = float(getattr(s, "start", 0.0))
-            dur = float(getattr(s, "duration", 2.0))
+            start = _safe_float(getattr(s, "start", 0.0))
+            dur = _safe_float(getattr(s, "duration", 2.0), 2.0)
         if text:
             segments.append({"text": text, "start": round(start, 2), "duration": round(dur, 2)})
     if not segments:
@@ -1305,8 +1305,8 @@ def build_synced_ass(
     raw_items: list[tuple[float, float, str]] = []
     full_sample = []
     for seg in transcript:
-        seg_start = float(seg["start"])
-        seg_end = seg_start + max(0.5, float(seg.get("duration", 2.0)))
+        seg_start = _safe_float(seg["start"])
+        seg_end = seg_start + max(0.5, _safe_float(seg.get("duration", 2.0), 2.0))
         if seg_end <= clip_start or seg_start >= clip_end:
             continue
         rel_start = max(0.0, seg_start - clip_start)
@@ -2505,16 +2505,40 @@ def probe_local_duration(video_path: Path) -> float:
             capture_output=True, text=True, timeout=300,
         )
         text = (res.stderr or "")
-        times = [float(t) for t in re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", text) for t in [t]]
         matches = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", text)
         if matches:
             h, mm, ss = matches[-1]
-            dur = int(h) * 3600 + int(mm) * 60 + float(ss)
+            dur = _safe_float(h) * 3600 + _safe_float(mm) * 60 + _safe_float(ss)
             if dur > 0:
                 return round(dur, 2)
     except Exception as exc:
         print(f"[PROBE] decode scan failed: {exc}")
     return 0.0
+
+
+def _even_suggestions(
+    duration: float, clip_len: int, max_clips: int, title: str
+) -> list[dict[str, Any]]:
+    """Last-resort clip plan: evenly spaced windows across the video."""
+    seg = float(min(clip_len, max(5, duration)))
+    step = max(seg, (duration - seg) / max(1, max_clips - 1)) if duration > seg else seg
+    out: list[dict[str, Any]] = []
+    t = 0.0
+    while len(out) < max_clips and t + 3 <= duration:
+        end = min(duration, t + seg)
+        out.append(
+            {
+                "start": round(t, 2),
+                "end": round(end, 2),
+                "score": 78,
+                "title": f"Highlight from {title}"[:80],
+                "description": f"A {int(end - t)}s highlight picked from {title}."[:200],
+                "hashtags": ["#Shorts", "#ViralClips", "#Reels", "#Trending"],
+                "reason": "evenly spaced pick",
+            }
+        )
+        t += step
+    return out
 
 
 def detect_uploaded_video_moments(
@@ -2553,17 +2577,19 @@ def detect_uploaded_video_moments(
             raw = ""
         buckets: list[list[float]] = [[] for _ in range(num_buckets)]
         cur_t = 0.0
-        for line in raw.splitlines():
-            mt = re.search(r"pts_time:([0-9.]+)", line)
-            if mt:
-                cur_t = float(mt.group(1))
-            mv = re.search(r"RMS_level=([-0-9.]+)", line)
-            if mv:
-                db = float(mv.group(1))
-                if not math.isnan(db) and not math.isinf(db):
+        try:
+            for line in raw.splitlines():
+                mt = re.search(r"pts_time:([-0-9.]+)", line)
+                if mt:
+                    cur_t = _safe_float(mt.group(1), cur_t)
+                mv = re.search(r"RMS_level=([-0-9.]+)", line)
+                if mv:
+                    db = _safe_float(mv.group(1), -91.0)
                     norm = max(0.05, min(1.0, (db + 55.0) / 48.0))
                     idx = min(num_buckets - 1, max(0, int(cur_t // bucket_sec)))
                     buckets[idx].append(norm)
+        except Exception as exc:
+            print(f"[ANALYZE] metric parse skipped ({exc}); using what we have")
         if any(buckets):
             energy = [sum(b) / len(b) if b else 0.45 for b in buckets]
 
@@ -2742,6 +2768,17 @@ def cut_uploaded_section(
     return plain_path, False, caption_note
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """float() that never explodes on FFmpeg junk like '.', '-', 'N/A'."""
+    try:
+        out = float(value)
+        if math.isnan(out) or math.isinf(out):
+            return default
+        return out
+    except (TypeError, ValueError):
+        return default
+
+
 def _free_mb() -> float:
     try:
         return shutil.disk_usage(str(DATA_DIR)).free / (1024 * 1024)
@@ -2751,7 +2788,8 @@ def _free_mb() -> float:
 
 def _make_room(need_mb: float) -> bool:
     """Delete old clips/uploads until `need_mb` fits (Render's disk is tiny)."""
-    keep = 180.0
+    need_mb = max(50.0, min(float(need_mb), 4096.0))
+    keep = 250.0
     if _free_mb() < 0:
         return True
     if _free_mb() >= need_mb + keep // 2:
@@ -2769,6 +2807,154 @@ def _make_room(need_mb: float) -> bool:
         except Exception:
             pass
     return _free_mb() >= need_mb + 30
+
+
+# ---------------- CHUNKED (RESUMABLE) UPLOAD FOR BIG FILES ----------------
+# A single 1 GB POST dies on free hosting, so the browser sends 8 MB slices and
+# we append them to one temp file. Same job pipeline afterwards.
+CHUNK_SIZE = 8 * 1024 * 1024
+CHUNK_DIR = UPLOADS_DIR / "_parts"
+CHUNK_LOCK = threading.Lock()
+
+
+class UploadInitRequest(BaseModel):
+    filename: str
+    size: int
+    clip_length: int = 30
+    max_clips: int = 5
+
+
+@app.post("/api/upload/init")
+def upload_init(body: UploadInitRequest, user: dict[str, Any] = Depends(get_current_user)):
+    ext = Path(body.filename or "video.mp4").suffix.lower()
+    if ext not in (".mp4", ".mov", ".webm", ".mkv", ".m4v"):
+        raise HTTPException(status_code=400, detail="Please upload an MP4, MOV, WebM, or MKV video file.")
+    if body.size > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"That file is {body.size / 1048576:.0f} MB but the limit is {MAX_UPLOAD_MB} MB.",
+        )
+    needed_mb = body.size / 1048576 * 1.35 + 200  # upload + clip outputs headroom
+    if not _make_room(needed_mb):
+        raise HTTPException(
+            status_code=507,
+            detail=(
+                f"Not enough free disk on the server for a {body.size / 1048576:.0f} MB video "
+                f"({_free_mb():.0f} MB free). Open My Clips and delete a few old clips, then retry."
+            ),
+        )
+    CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+    upload_id = secrets.token_hex(10)
+    part = CHUNK_DIR / f"{upload_id}.part"
+    part.touch()
+    meta = {
+        "filename": body.filename,
+        "ext": ext,
+        "size": body.size,
+        "clip_length": body.clip_length if body.clip_length in (30, 45, 60) else 30,
+        "max_clips": body.max_clips if body.max_clips in (5, 10, 20) else 5,
+        "received": 0,
+        "user_id": user["id"],
+    }
+    (CHUNK_DIR / f"{upload_id}.json").write_text(json.dumps(meta))
+    print(f"[UPLOAD] chunked upload started {upload_id} ({body.size/1048576:.0f} MB)")
+    return {
+        "upload_id": upload_id,
+        "chunk_size": CHUNK_SIZE,
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "free_mb": round(_free_mb()),
+    }
+
+
+@app.put("/api/upload/chunk/{upload_id}")
+async def upload_chunk(
+    upload_id: str,
+    index: int = 0,
+    request: Request = None,
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    meta_path = CHUNK_DIR / f"{upload_id}.json"
+    part_path = CHUNK_DIR / f"{upload_id}.part"
+    if not meta_path.exists() or not part_path.exists():
+        raise HTTPException(status_code=404, detail="Upload session expired. Please pick the file again.")
+    meta = json.loads(meta_path.read_text())
+    if meta.get("user_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not your upload.")
+
+    with CHUNK_LOCK:
+        received = part_path.stat().st_size
+        expected_offset = index * CHUNK_SIZE
+        if expected_offset > received:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Chunk {index} arrived out of order (server has {received} bytes).",
+            )
+        body = await request.body()
+        if not body:
+            raise HTTPException(status_code=400, detail="Empty chunk.")
+        if expected_offset + len(body) > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"File exceeds the {MAX_UPLOAD_MB} MB limit.")
+        with part_path.open("r+b") as f:
+            f.seek(expected_offset)
+            f.truncate(expected_offset)
+            f.write(body)
+        received = part_path.stat().st_size
+        meta["received"] = received
+        meta_path.write_text(json.dumps(meta))
+
+    return {"received": received, "total": meta["size"], "percent": round(received * 100 / max(1, meta["size"]), 1)}
+
+
+class UploadFinishRequest(BaseModel):
+    srt_text: str | None = None
+
+
+@app.post("/api/upload/finish/{upload_id}")
+def upload_finish(
+    upload_id: str,
+    body: UploadFinishRequest | None = None,
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    meta_path = CHUNK_DIR / f"{upload_id}.json"
+    part_path = CHUNK_DIR / f"{upload_id}.part"
+    if not meta_path.exists() or not part_path.exists():
+        raise HTTPException(status_code=404, detail="Upload session expired. Please pick the file again.")
+    meta = json.loads(meta_path.read_text())
+    if meta.get("user_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Not your upload.")
+
+    received = part_path.stat().st_size
+    if received < meta["size"] * 0.98:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload incomplete ({received/1048576:.0f} of {meta['size']/1048576:.0f} MB). Please retry.",
+        )
+
+    vid_id = f"up_{secrets.token_hex(5)}"
+    saved_path = UPLOADS_DIR / f"{vid_id}{meta['ext']}"
+    part_path.replace(saved_path)
+    meta_path.unlink(missing_ok=True)
+
+    transcript: list[dict[str, Any]] = []
+    srt_text = (body.srt_text if body else None) or ""
+    if srt_text.strip():
+        try:
+            transcript = parse_subtitles(srt_text)
+            print(f"[UPLOAD] Parsed {len(transcript)} subtitle segments (chunked upload)")
+        except Exception as exc:
+            print(f"[UPLOAD] Subtitle parse failed: {exc}")
+
+    job_id = _job_create(kind="upload")
+    threading.Thread(
+        target=_run_upload_job,
+        args=(
+            job_id, user, saved_path, meta["filename"],
+            meta["clip_length"], meta["max_clips"], transcript,
+        ),
+        daemon=True,
+    ).start()
+    print(f"[UPLOAD] chunked upload complete: {saved_path.name} ({received/1048576:.0f} MB)")
+    return {"job_id": job_id, "status": "queued", "message": "Upload complete — analysing audio..."}
 
 
 @app.post("/api/upload")
@@ -2790,7 +2976,7 @@ async def upload_video(
     clip_length = clip_length if clip_length in (30, 45, 60) else 30
     max_clips = max_clips if max_clips in (5, 10, 20) else 5
 
-    if not _make_room(float(MAX_UPLOAD_MB)):
+    if not _make_room(300.0):
         raise HTTPException(
             status_code=507,
             detail="The server is out of free disk space. Delete a few saved clips/projects and try again.",
@@ -3044,9 +3230,14 @@ def _perform_upload(
     clean_title = (
         Path(orig_name).stem.replace("_", " ").replace("-", " ").strip() or "Uploaded Video"
     )
-    suggestions = detect_uploaded_video_moments(
-        saved_path, duration, clip_length, max_clips, clean_title
-    )
+    try:
+        suggestions = detect_uploaded_video_moments(
+            saved_path, duration, clip_length, max_clips, clean_title
+        )
+    except Exception as exc:
+        # A weird codec/metadata value must never kill the upload.
+        print(f"[UPLOAD] moment detection failed ({exc}); using evenly spaced clips")
+        suggestions = _even_suggestions(duration, clip_length, max_clips, clean_title)
     if not suggestions:
         raise RuntimeError("Video is too short to generate clips (need at least ~5 seconds).")
 

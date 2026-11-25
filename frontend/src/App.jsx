@@ -454,6 +454,8 @@ export default function App() {
   const [analyzeSuccess, setAnalyzeSuccess] = useState("");
 
   const [cuttingKey, setCuttingKey] = useState(null);
+  const [uploadPct, setUploadPct] = useState(0);
+  const [uploadNote, setUploadNote] = useState("");
   const [downloadingId, setDownloadingId] = useState(null);
   const [downloadPct, setDownloadPct] = useState(0);
   const [clipStatus, setClipStatus] = useState({ type: "", text: "" });
@@ -604,70 +606,160 @@ export default function App() {
     e.target.value = "";
     if (!file) return;
 
-    const limitMb = health?.max_upload_mb || 95;
+    const limitMb = health?.max_upload_mb || 1024;
     const sizeMb = file.size / (1024 * 1024);
     if (sizeMb > limitMb) {
       setAnalyzeError(
         `"${file.name}" is ${sizeMb.toFixed(0)} MB but the limit is ${limitMb} MB. ` +
-          `Fix: download the video in 360p or 720p (much smaller), or cut out just the part you need first.`
+          `Fix: export it at 720p (much smaller), or trim it to the part you need first.`
       );
       return;
     }
+
     setAnalyzing(true);
     setAnalyzeError("");
     setAnalyzeSuccess("");
     setClipStatus({ type: "", text: "" });
-    try {
-      const form = new FormData();
-      form.append("file", file);
-      if (subsFile) form.append("subs", subsFile);
-      form.append("clip_length", String(clipLength));
-      form.append("max_clips", String(maxClips));
-      const data = await apiFetch("/upload?job=1", {
-        method: "POST",
-        body: form,
-      });
+    setUploadPct(0);
+    setUploadNote("");
 
-      // Upload now returns a job id — poll it so slow free-tier CPUs never time out.
-      let proj = data.project;
-      if (!proj) {
-        const jobId = data.job_id;
-        const startedAt = Date.now();
-        let job = data;
-        while (job.status !== "done" && job.status !== "error") {
-          if (Date.now() - startedAt > 20 * 60 * 1000) {
-            throw new Error("Analysis took over 20 minutes. Try a shorter video (under ~10 min).");
-          }
-          await new Promise((r) => setTimeout(r, 2500));
-          job = await apiFetch(`/clips/job/${jobId}`);
-          const elapsed = Math.round((Date.now() - startedAt) / 1000);
-          setClipStatus({
-            type: "info",
-            text: `${job.message || "Analysing video..."} (${elapsed}s) — keep this tab open.`,
-          });
+    try {
+      let srtText = null;
+      if (subsFile) {
+        try {
+          srtText = await subsFile.text();
+        } catch {
+          srtText = null;
         }
-        if (job.status === "error") {
-          throw new Error(job.error || "Upload analysis failed.");
-        }
-        proj = job.project;
       }
 
-      setSelectedProjectId(proj.id);
-      setAnalyzeSuccess(
-        `Uploaded "${proj.title}" and found ${proj.suggestions.length} high-energy ${proj.clip_length}s clips! ` +
-          (proj.captions_available
-            ? `Captions loaded (${proj.caption_segments} lines) — clips will have ${captionTheme} CC. `
-            : "No .srt attached, so clips will be exported without captions. ") +
-          'Click "Cut & Download" below.'
-      );
-      setSubsFile(null);
-      setClipStatus({ type: "", text: "" });
+      // ALWAYS upload in slices. One long POST can hang forever on free hosting
+      // (cold starts, proxy timeouts); short requests always finish or fail fast.
+      const useChunked = true;
+      let jobId;
+
+      if (useChunked) {
+        setUploadNote(`Connecting to the server… (first upload can take ~60s to wake it up)`);
+        let init;
+        try {
+          init = await apiFetch("/upload/init", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              filename: file.name,
+              size: file.size,
+              clip_length: clipLength,
+              max_clips: maxClips,
+            }),
+          });
+        } catch (e) {
+          if (/not found|404/i.test(e.message)) {
+            throw new Error(
+              "Your server is running an OLD build (this page expects the new upload API). " +
+                "In Render: Manual Deploy → Clear build cache & deploy, wait for 'Deploy live', then hard-refresh."
+            );
+          }
+          throw e;
+        }
+        const chunkSize = init.chunk_size || 8 * 1024 * 1024;
+        const total = Math.max(1, Math.ceil(file.size / chunkSize));
+        for (let i = 0; i < total; i += 1) {
+          const slice = file.slice(i * chunkSize, Math.min(file.size, (i + 1) * chunkSize));
+          let lastErr = null;
+          let done = false;
+          for (let attempt = 1; attempt <= 4 && !done; attempt += 1) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 120000);
+            try {
+              const res = await fetch(
+                `${API_BASE}/upload/chunk/${init.upload_id}?index=${i}`,
+                {
+                  method: "PUT",
+                  headers: {
+                    Authorization: `Bearer ${token}`,
+                    "Content-Type": "application/octet-stream",
+                  },
+                  body: slice,
+                  signal: controller.signal,
+                }
+              );
+              clearTimeout(timer);
+              if (res.ok) {
+                done = true;
+              } else {
+                const err = await res.json().catch(() => ({}));
+                lastErr = new Error(err.detail || `Part ${i + 1} of ${total} failed (HTTP ${res.status}).`);
+                if (res.status === 404 || res.status === 413 || res.status === 507) {
+                  throw lastErr; // no point retrying these
+                }
+              }
+            } catch (err) {
+              clearTimeout(timer);
+              lastErr = err.name === "AbortError"
+                ? new Error(`Part ${i + 1} of ${total} timed out. Check your internet and retry.`)
+                : err;
+              if (String(lastErr.message).includes("expired")) throw lastErr;
+              await new Promise((r) => setTimeout(r, 1500 * attempt));
+            }
+          }
+          if (!done) throw lastErr || new Error(`Upload failed at part ${i + 1} of ${total}.`);
+          setUploadPct(Math.round(((i + 1) / total) * 100));
+          setUploadNote(
+            `Uploading ${sizeMb.toFixed(0)} MB in parts… (${i + 1}/${total})`
+          );
+        }
+        setUploadNote("Upload finished — starting analysis…");
+        const fin = await apiFetch(`/upload/finish/${init.upload_id}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ srt_text: srtText }),
+        });
+        jobId = fin.job_id;
+      } else {
+        const form = new FormData();
+        form.append("file", file);
+        if (subsFile) form.append("subs", subsFile);
+        form.append("clip_length", String(clipLength));
+        form.append("max_clips", String(maxClips));
+        const data = await apiFetch("/upload?job=1", { method: "POST", body: form });
+        if (data.project) {
+          await loadWorkspace();
+          setSelectedProjectId(data.project.id);
+          setAnalyzeSuccess(`Analysed "${data.project.title}" — ${data.project.suggestions.length} clips ready to cut.`);
+          return;
+        }
+        jobId = data.job_id;
+      }
+
+      // Poll the job so slow free-tier CPUs never time out.
+      const startedAt = Date.now();
+      let job = { status: "queued", message: "Queued..." };
+      while (job.status !== "done" && job.status !== "error") {
+        if (Date.now() - startedAt > 45 * 60 * 1000) {
+          throw new Error("Analysis took over 45 minutes. Try a shorter video.");
+        }
+        await new Promise((r) => setTimeout(r, 2500));
+        job = await apiFetch(`/clips/job/${jobId}`);
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        setClipStatus({
+          type: "info",
+          text: `${job.message || "Analysing video..."} (${elapsed}s) — keep this tab open.`,
+        });
+      }
+      if (job.status === "error") throw new Error(job.error || "Analysis failed.");
+      if (job.project) {
+        setSelectedProjectId(job.project.id);
+        setAnalyzeSuccess(
+          `Analysed "${job.project.title}" — ${job.project.suggestions.length} clips ready to cut.`
+        );
+      }
       await loadWorkspace();
-      setActiveTab("dashboard");
     } catch (err) {
       setAnalyzeError(err.message);
     } finally {
       setAnalyzing(false);
+      setUploadPct(0);
+      setUploadNote("");
     }
   }
 
@@ -1028,9 +1120,33 @@ export default function App() {
                   {analyzing ? "Processing your video…" : "Upload Video (MP4)"}
                 </strong>
                 <span style={{ fontSize: 12.5, color: "#9b9bb4" }}>
-                  MP4 · MOV · MKV · WEBM — up to {health?.max_upload_mb || 95} MB · 360p or 720p
-                  uploads are fastest
+                  MP4 · MOV · MKV · WEBM — up to {health?.max_upload_mb || 1024} MB · big files
+                  upload in 8 MB parts
                 </span>
+                {analyzing && (uploadPct > 0 || uploadNote) && (
+                  <div style={{ width: "100%", maxWidth: 460, marginTop: 10 }}>
+                    <div
+                      style={{
+                        height: 8,
+                        borderRadius: 999,
+                        background: "rgba(255,255,255,0.09)",
+                        overflow: "hidden",
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: `${uploadPct}%`,
+                          height: "100%",
+                          background: "linear-gradient(90deg,#8b5cf6,#c4b5fd)",
+                          transition: "width 0.25s ease",
+                        }}
+                      />
+                    </div>
+                    <span style={{ fontSize: 12, color: "#c4b5fd", display: "block", marginTop: 6 }}>
+                      {uploadNote || "Uploading…"} {uploadPct > 0 ? `${uploadPct}%` : ""}
+                    </span>
+                  </div>
+                )}
                 <input
                   type="file"
                   accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv"
@@ -1083,7 +1199,7 @@ export default function App() {
               <div className="hero-subrow">
                 <small>
                   Auto-generates Viral Title, Description &amp; Hashtags · 1080p smooth export · Max upload{" "}
-                  {health?.max_upload_mb || 95} MB · Want burned captions? Choose the{" "}
+                  {health?.max_upload_mb || 1024} MB · Want burned captions? Choose the{" "}
                   <strong>.srt</strong> file first, then upload your video
                 </small>
                 <div className="hero-quick-btns">
