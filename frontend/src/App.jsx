@@ -647,14 +647,16 @@ export default function App() {
 
   async function handleCutClip(project, suggestion) {
     const key = `${project.id}_${suggestion.start}_${suggestion.end}`;
+    const startedAt = Date.now();
     setCuttingKey(key);
     setClipStatus({
       type: "info",
-      text: "Cutting 1080p clip" + (burnCaptions ? " & burning synced captions" : "") + "... this can take 15–45 seconds.",
+      text: "Starting clip job" + (burnCaptions ? " with synced captions" : "") + "...",
     });
 
     try {
-      const data = await apiFetch("/clips/cut", {
+      // 1) Start the background job (returns instantly)
+      const startData = await apiFetch("/clips/cut", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -670,19 +672,44 @@ export default function App() {
         }),
       });
 
+      // 2) Poll the job until it finishes (works even on slow free-tier CPUs)
+      const jobId = startData.job_id;
+      let job = startData;
+      const MAX_WAIT_MS = 15 * 60 * 1000; // 15 minutes hard ceiling
+
+      while (job.status !== "done" && job.status !== "error") {
+        if (Date.now() - startedAt > MAX_WAIT_MS) {
+          throw new Error(
+            "This clip took over 15 minutes. Try a shorter clip or switch Captions OFF for a faster export."
+          );
+        }
+        await new Promise((r) => setTimeout(r, 2500));
+        job = await apiFetch(`/clips/job/${jobId}`);
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        setClipStatus({
+          type: "info",
+          text: `${job.message || "Cutting clip..."} (${elapsed}s) — keep this tab open.`,
+        });
+      }
+
+      if (job.status === "error") {
+        throw new Error(job.error || "Clip cutting failed.");
+      }
+
+      const clip = job.clip;
       await loadWorkspace();
 
       setClipStatus({
-        type: data.note ? "warn" : "success",
-        text: data.note
-          ? `${data.note} Saved to My Clips.`
-          : `Clip saved to My Clips (${data.clip.quality}${data.clip.has_captions ? " + CC" : ""})! Downloading now...`,
+        type: job.note ? "warn" : "success",
+        text: job.note
+          ? `${job.note} Saved to My Clips.`
+          : `Clip saved to My Clips (${clip.quality}${clip.has_captions ? " + CC" : ""})! Downloading now...`,
       });
 
-      // Trigger browser file download
+      // 3) Trigger browser file download
       const a = document.createElement("a");
-      a.href = data.clip.download_url;
-      a.download = data.clip.filename;
+      a.href = clip.download_url;
+      a.download = clip.filename;
       document.body.appendChild(a);
       a.click();
       a.remove();

@@ -11,6 +11,7 @@ import smtplib
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -20,6 +21,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
+import httpx
 import imageio_ffmpeg
 import yt_dlp
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -36,6 +38,20 @@ MAX_HEIGHT = 1080       # 1080 (best compatibility) or 1440
 CAPTIONS = True         # Set False to skip burning captions
 CLIP_DURATION = 30      # Default clip length in seconds
 TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
+
+# ---- ENCODING PROFILE (auto-tuned for cloud free tiers with tiny CPUs) ----
+# Render Free = 0.1 CPU. "veryfast" 1080p there takes many minutes, so we
+# automatically switch to "ultrafast" on Render unless you override it.
+LOW_CPU = (
+    os.getenv("LOW_CPU", "").strip().lower() in ("1", "true", "yes", "on")
+    or bool(os.getenv("RENDER"))
+)
+ENCODE_PRESET = os.getenv("ENCODE_PRESET", "").strip() or (
+    "ultrafast" if LOW_CPU else "veryfast"
+)
+ENCODE_CRF = os.getenv("ENCODE_CRF", "").strip() or ("24" if LOW_CPU else "21")
+# Generous encode timeout: slow cloud CPUs need minutes, not seconds.
+ENCODE_TIMEOUT = int(os.getenv("ENCODE_TIMEOUT", "600" if LOW_CPU else "240"))
 
 # Add your admin email(s) here (the very first registered account is also auto-admin!)
 ADMIN_EMAILS = {"rahulgoudapatil7@gmail.com"}
@@ -1163,8 +1179,10 @@ def encode_smooth_clip(
         "-profile:v", "high",
         "-level", "4.1",
         "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
-        "-crf", "21",
+        "-preset", ENCODE_PRESET,
+        "-crf", str(ENCODE_CRF),
+        # On tiny cloud CPUs, spawning a thread per host core causes thrashing.
+        "-threads", str(2 if LOW_CPU else max(1, (os.cpu_count() or 1))),
         "-c:a", "aac",
         "-b:a", "128k",
         "-ar", "44100",
@@ -1174,7 +1192,7 @@ def encode_smooth_clip(
         "-movflags", "+faststart",
         str(out_video),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=ENCODE_TIMEOUT)
     if res.returncode == 0 and out_video.exists() and out_video.stat().st_size > 10_000:
         return True, ""
     err = (res.stderr or "")[-500:]
@@ -1205,6 +1223,7 @@ def cut_youtube_section(
     transcript: list[dict[str, Any]],
     with_captions: bool = True,
     caption_theme: str = "gold",
+    progress: Any = None,
 ) -> tuple[Path, bool, str | None]:
     """
     Zero-lag 2-stage 1080p clip pipeline:
@@ -1213,6 +1232,13 @@ def cut_youtube_section(
     """
     if not FFMPEG_BIN:
         raise RuntimeError("FFmpeg is not ready on this machine. Check FFMPEG CHECK in backend terminal.")
+
+    def _p(msg: str) -> None:
+        if callable(progress):
+            try:
+                progress(msg)
+            except Exception:
+                pass
 
     start_i = max(0, int(math.floor(start)))
     end_i = max(start_i + 5, int(math.ceil(end)))
@@ -1243,11 +1269,14 @@ def cut_youtube_section(
 
     # ---- STAGE 1: Fast raw download to local disk (NO encoding while reading HTTP!) ----
     print(f"[CLIP] Stage 1/2: Fast-fetching {clip_dur:.0f}s section ({start_i}s-{end_i}s, {MAX_HEIGHT}p)...")
+    _p(f"Downloading {clip_dur:.0f}s section from YouTube...")
     if raw_path.exists():
         raw_path.unlink(missing_ok=True)
 
     downloaded_raw = False
-    try:
+
+    def _fast_copy_once() -> bool:
+        """Extract fresh stream URLs and range-copy ONLY this clip section."""
         info_opts = {
             "format": fmt,
             "skip_download": True,
@@ -1270,64 +1299,122 @@ def cut_youtube_section(
             a_url = None
             hdrs = info.get("http_headers") or {}
 
-        if v_url:
-            ua = hdrs.get("User-Agent", "Mozilla/5.0")
-            # Grab 2s extra padding on copy so final trim is frame-clean with zero audio gap
-            pad_start = max(0.0, start - 0.5)
-            pad_dur = clip_dur + 1.0
-            ff_copy = [
-                FFMPEG_BIN, "-y",
+        if not v_url:
+            return False
+
+        ua = hdrs.get("User-Agent", "Mozilla/5.0")
+        # Grab 1s extra padding on the copy so the final trim is frame-clean
+        pad_start = max(0.0, start - 0.5)
+        pad_dur = clip_dur + 1.0
+        ff_copy = [
+            FFMPEG_BIN, "-y",
+            "-user_agent", ua,
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+            "-ss", f"{pad_start:.2f}",
+            "-i", v_url,
+        ]
+        if a_url:
+            ff_copy += [
                 "-user_agent", ua,
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                 "-ss", f"{pad_start:.2f}",
-                "-i", v_url,
+                "-i", a_url,
+                "-map", "0:v:0", "-map", "1:a:0",
             ]
-            if a_url:
-                ff_copy += [
-                    "-user_agent", ua,
-                    "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                    "-ss", f"{pad_start:.2f}",
-                    "-i", a_url,
-                    "-map", "0:v:0", "-map", "1:a:0",
-                ]
-            ff_copy += [
-                "-t", f"{pad_dur:.2f}",
-                "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
-                str(raw_path),
-            ]
-            r_copy = subprocess.run(ff_copy, capture_output=True, text=True, timeout=90)
-            if r_copy.returncode == 0 and raw_path.exists() and raw_path.stat().st_size > 20_000:
+        ff_copy += [
+            "-t", f"{pad_dur:.2f}",
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            str(raw_path),
+        ]
+        # FFmpeg must ALSO exit through the residential proxy, otherwise
+        # googlevideo.com rejects the datacenter IP (403) and the copy stalls.
+        ff_env = None
+        if PROXY_URL:
+            ff_env = {
+                **os.environ,
+                "http_proxy": PROXY_URL,
+                "https_proxy": PROXY_URL,
+                "HTTP_PROXY": PROXY_URL,
+                "HTTPS_PROXY": PROXY_URL,
+                "ALL_PROXY": PROXY_URL,
+            }
+        r_copy = subprocess.run(
+            ff_copy, capture_output=True, text=True, timeout=150, env=ff_env
+        )
+        ok = r_copy.returncode == 0 and raw_path.exists() and raw_path.stat().st_size > 20_000
+        if not ok:
+            print(f"[CLIP] Fast copy attempt failed: {(r_copy.stderr or '')[-220:]}")
+        return ok
+
+    # Signed YouTube URLs expire and transient failures happen -> retry a few times.
+    for attempt in range(1, 4):
+        try:
+            if _fast_copy_once():
                 downloaded_raw = True
-            else:
-                print(f"[CLIP] Fast copy fallback needed: {(r_copy.stderr or '')[-200:]}")
-    except Exception as exc:
-        print(f"[CLIP] Fast copy error ({exc}), using yt-dlp fallback...")
+                break
+        except Exception as exc:
+            print(f"[CLIP] Fast copy attempt {attempt} error: {exc}")
+        if attempt < 3:
+            print(f"[CLIP] Retrying fast copy ({attempt}/3) with a fresh URL...")
+            time.sleep(1.0 * attempt)
 
     if not downloaded_raw:
+        # SAFE FALLBACK: only progressive (single-file) formats honour ranged
+        # downloads. DASH separate video/audio tracks would pull the WHOLE file
+        # (2-3 GB -> hours) which is what used to freeze the page on "Cutting...".
+        _p("Fast path failed — trying a safer fallback download...")
+        fallback_fmt = (
+            f"best[height<={MAX_HEIGHT}][ext=mp4][protocol^=http]/"
+            f"best[height<={MAX_HEIGHT}][ext=mp4]/best[ext=mp4]/best"
+        )
         ydl_opts = {
-            "format": fmt,
+            "format": fallback_fmt,
             "outtmpl": str(raw_path),
             "merge_output_format": "mp4",
-            "ffmpeg_location": str(FFMPEG_DIR),
+            "ffmpeg_location": str(FFMPEG_DIR) if FFMPEG_DIR.exists() else None,
             "download_sections": yt_dlp.utils.download_range_func(None, [(start, end)]),
             "noplaylist": True,
-            "quiet": False,
+            "quiet": True,
+            "no_warnings": True,
             "socket_timeout": 25,
+            # Hard safety caps: never let a stuck download run for hours.
+            "max_filesize": 200 * 1024 * 1024,
+            "retries": 2,
+            "noprogress": True,
             **get_ytdlp_js_opts(),
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        if not raw_path.exists():
-            matches = list(CLIPS_DIR.glob(f"{tag}_raw.*"))
+        ydl_opts = {k: v for k, v in ydl_opts.items() if v is not None}
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception as exc:
+            ass_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                "Could not download this clip section from YouTube. "
+                "The server was blocked or the PROXY_URL is failing — "
+                "check Render logs / renew your residential proxy. "
+                f"(detail: {str(exc)[:180]})"
+            )
+        if not raw_path.exists() or raw_path.stat().st_size < 20_000:
+            matches = [
+                m for m in CLIPS_DIR.glob(f"{tag}_raw.*") if m.stat().st_size > 20_000
+            ]
             if matches:
                 raw_path = matches[0]
             else:
                 ass_path.unlink(missing_ok=True)
-                raise RuntimeError("Could not download clip section from YouTube.")
+                raise RuntimeError(
+                    "YouTube download produced no usable video data. "
+                    "Please try again, or switch Captions OFF for a faster export."
+                )
 
     # ---- STAGE 2: Local smooth CFR 30fps re-encode + Premium Captions ----
     print(f"[CLIP] Stage 2/2: Encoding smooth 30fps {MAX_HEIGHT}p MP4" + (f" + {theme_slug} captions..." if has_ass else "..."))
+    _p(
+        f"Encoding {MAX_HEIGHT}p 30fps" + (" + burning captions" if has_ass else "")
+        + (" (render is still running — free tier CPU is slow, please wait)" if LOW_CPU else " — almost done...")
+    )
     caption_note: str | None = None
     if has_ass:
         ok, _err = encode_smooth_clip(raw_path, final_path, ass_path=ass_path, font_file=used_font_file)
@@ -1539,9 +1626,28 @@ class CutClipRequest(BaseModel):
     caption_theme: str = "gold"
 
 
+def _test_proxy() -> dict[str, Any]:
+    """Live proxy check: does PROXY_URL actually authenticate and reach the internet?"""
+    if not PROXY_URL:
+        return {"ok": False, "detail": "PROXY_URL is not set."}
+    try:
+        with httpx.Client(proxy=PROXY_URL, timeout=12, follow_redirects=True) as client:
+            res = client.get("https://ipinfo.io/json")
+        data = res.json()
+        return {
+            "ok": res.status_code == 200,
+            "status_code": res.status_code,
+            "exit_ip": data.get("ip"),
+            "country": data.get("country"),
+            "org": data.get("org"),
+        }
+    except Exception as exc:
+        return {"ok": False, "detail": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+
 @app.get("/api/health")
-def health():
-    return {
+def health(proxy: int = 0):
+    payload: dict[str, Any] = {
         "status": "ok",
         "service": "ViralCut AI Backend",
         "ffmpeg_ready": bool(FFMPEG_BIN),
@@ -1553,7 +1659,13 @@ def health():
         "youtube_cookies_count": YOUTUBE_COOKIES_COUNT,
         "youtube_auth_cookies_ok": YOUTUBE_AUTH_COOKIES_OK,
         "proxy_configured": bool(PROXY_URL),
+        "encode_preset": ENCODE_PRESET,
+        "encode_crf": ENCODE_CRF,
+        "low_cpu_mode": LOW_CPU,
     }
+    if proxy:
+        payload["proxy_test"] = _test_proxy()
+    return payload
 
 
 # ---------- AUTH ROUTES ----------
@@ -2168,16 +2280,48 @@ def create_demo(user: dict[str, Any] = Depends(get_current_user)):
 
 
 # ---------- CUT & SAVE REAL CLIP (ONLY THESE APPEAR IN "MY CLIPS") ----------
-@app.post("/api/clips/cut")
-def cut_clip(body: CutClipRequest, user: dict[str, Any] = Depends(get_current_user)):
-    with get_db() as conn:
-        proj = conn.execute(
-            "SELECT * FROM projects WHERE id = ? AND user_id = ?",
-            (body.project_id, user["id"]),
-        ).fetchone()
-    if not proj:
-        raise HTTPException(status_code=404, detail="Project not found.")
+# Cuts run as a BACKGROUND JOB so the browser request can never hang while a
+# 1080p clip encodes. (Render Free = 0.1 CPU, a real clip can take 1-4 minutes.)
+CUT_JOBS: dict[str, dict[str, Any]] = {}
+CUT_JOBS_LOCK = threading.Lock()
+CUT_JOB_TTL = 60 * 60  # keep finished jobs around for 1 hour
 
+
+def _job_create() -> str:
+    job_id = secrets.token_hex(8)
+    now = time.time()
+    with CUT_JOBS_LOCK:
+        for stale in [
+            k for k, v in CUT_JOBS.items() if now - v.get("updated_at", now) > CUT_JOB_TTL
+        ]:
+            CUT_JOBS.pop(stale, None)
+        CUT_JOBS[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "message": "Queued...",
+            "started_at": now,
+            "updated_at": now,
+            "clip": None,
+            "note": None,
+            "error": None,
+        }
+    return job_id
+
+
+def _job_update(job_id: str, **fields: Any) -> None:
+    with CUT_JOBS_LOCK:
+        job = CUT_JOBS.get(job_id)
+        if job:
+            job.update(fields)
+            job["updated_at"] = time.time()
+
+
+def _perform_cut(
+    body: "CutClipRequest",
+    user: dict[str, Any],
+    proj: Any,
+    progress: Any = None,
+) -> tuple[dict[str, Any], str | None]:
     transcript = json.loads(proj["transcript_json"])
     try:
         if proj["video_id"] == "demo_viralcut":
@@ -2205,9 +2349,12 @@ def cut_clip(body: CutClipRequest, user: dict[str, Any] = Depends(get_current_us
                 transcript,
                 with_captions=body.captions,
                 caption_theme=body.caption_theme,
+                progress=progress,
             )
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise RuntimeError(str(exc))
 
     now = datetime.now(timezone.utc).isoformat()
     quality = f"{MAX_HEIGHT}p"
@@ -2235,8 +2382,8 @@ def cut_clip(body: CutClipRequest, user: dict[str, Any] = Depends(get_current_us
         )
         clip_id = cur.lastrowid
 
-    return {
-        "clip": {
+    return (
+        {
             "id": clip_id,
             "project_id": proj["id"],
             "video_id": proj["video_id"],
@@ -2254,8 +2401,74 @@ def cut_clip(body: CutClipRequest, user: dict[str, Any] = Depends(get_current_us
             "download_url": f"/api/clips/file/{out_path.name}?download=1",
             "created_at": now,
         },
-        "note": note,
+        note,
+    )
+
+
+def _run_cut_job(job_id: str, body: "CutClipRequest", user: dict[str, Any], proj: Any) -> None:
+    try:
+        _job_update(job_id, status="running", message="Preparing clip...")
+        clip, note = _perform_cut(
+            body, user, proj, progress=lambda msg: _job_update(job_id, message=msg)
+        )
+        _job_update(
+            job_id,
+            status="done",
+            message="Clip ready!",
+            clip=clip,
+            note=note,
+            finished_at=time.time(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[CUT JOB {job_id}] FAILED: {exc}")
+        _job_update(
+            job_id,
+            status="error",
+            message="Clip cutting failed.",
+            error=str(exc) or "Unknown error while cutting the clip.",
+            finished_at=time.time(),
+        )
+
+
+@app.post("/api/clips/cut")
+def cut_clip(body: CutClipRequest, user: dict[str, Any] = Depends(get_current_user)):
+    """Starts a background cut job and returns immediately with a job id."""
+    with get_db() as conn:
+        proj = conn.execute(
+            "SELECT * FROM projects WHERE id = ? AND user_id = ?",
+            (body.project_id, user["id"]),
+        ).fetchone()
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    job_id = _job_create()
+    threading.Thread(
+        target=_run_cut_job,
+        args=(job_id, body, user, dict(proj)),
+        daemon=True,
+    ).start()
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Queued...",
+        "poll_url": f"/api/clips/job/{job_id}",
     }
+
+
+@app.get("/api/clips/job/{job_id}")
+def get_cut_job(job_id: str, user: dict[str, Any] = Depends(get_current_user)):
+    """Poll this to follow a cut job: queued -> running -> done / error."""
+    with CUT_JOBS_LOCK:
+        job = CUT_JOBS.get(job_id)
+        snapshot = dict(job) if job else None
+    if not snapshot:
+        raise HTTPException(
+            status_code=404,
+            detail="This clip job expired (the server restarted). Please click Cut & Download again.",
+        )
+    elapsed = round(time.time() - snapshot.get("started_at", time.time()), 1)
+    snapshot["elapsed"] = elapsed
+    return snapshot
 
 
 @app.delete("/api/clips/{clip_id}")
