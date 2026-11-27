@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-26-captions-db"
+BUILD_TAG = "2026-11-26-db-guard"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -532,7 +532,14 @@ SECRET_KEY = get_secret_key()
 # If DATABASE_URL is set (free Neon / Supabase / Render Postgres) we store
 # everything there instead. All existing SQLite-style SQL keeps working.
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DB_MODE = "postgres" if DATABASE_URL else "sqlite-ephemeral"
+DB_WARNING = ""
+if DATABASE_URL and psycopg is None:
+    DB_WARNING = (
+        "DATABASE_URL is set but the 'psycopg' package is missing, so accounts are still "
+        "temporary. Add psycopg[binary] to your Dockerfile / requirements install."
+    )
+    print(f"[DB] WARNING: {DB_WARNING}")
+DB_MODE = "postgres" if (DATABASE_URL and psycopg is not None) else "sqlite-ephemeral"
 
 
 def _pg_sql(sql: str) -> str:
@@ -606,25 +613,44 @@ class _PGConn:
         self._raw.close()
 
 
+_PG_FAILED = False
+
+
+def _db_mode() -> str:
+    if DATABASE_URL and psycopg is not None and not _PG_FAILED:
+        return "postgres"
+    return "sqlite-ephemeral"
+
+
 @contextmanager
 def get_db():
-    if DATABASE_URL:
+    global _PG_FAILED
+    if DATABASE_URL and psycopg is not None and not _PG_FAILED:
         from psycopg.rows import dict_row
 
-        raw = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-        conn = _PGConn(raw)
         try:
-            yield conn
-            raw.commit()
-        except Exception:
+            raw = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        except Exception as exc:
+            # A bad URL/password must never take the whole site down.
+            _PG_FAILED = True
+            print(
+                f"[DB] Postgres unavailable ({str(exc)[:160]}). "
+                "Falling back to local SQLite for this run — accounts will be temporary."
+            )
+        else:
+            conn = _PGConn(raw)
             try:
-                raw.rollback()
+                yield conn
+                raw.commit()
             except Exception:
-                pass
-            raise
-        finally:
-            raw.close()
-        return
+                try:
+                    raw.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                raw.close()
+            return
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -2156,7 +2182,8 @@ def health(proxy: int = 0):
         "youtube_cookies_loaded": bool(YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists()),
         "youtube_cookies_count": YOUTUBE_COOKIES_COUNT,
         "youtube_auth_cookies_ok": YOUTUBE_AUTH_COOKIES_OK,
-        "db_mode": DB_MODE,
+        "db_mode": _db_mode(),
+        "db_warning": DB_WARNING or (None if not _PG_FAILED else "Postgres unreachable — using temporary SQLite."),
         "auto_captions": _whisper_available(),
         "whisper_model": WHISPER_MODEL_SIZE,
         "proxy_configured": bool(PROXY_URL),
