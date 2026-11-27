@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-27-stable-session"
+BUILD_TAG = "2026-11-27-register-fix"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -584,6 +584,18 @@ if DATABASE_URL and psycopg is None:
 DB_MODE = "postgres" if (DATABASE_URL and psycopg is not None) else "sqlite-ephemeral"
 
 
+def _is_duplicate_error(exc: Exception) -> bool:
+    """True for both SQLite's IntegrityError and Postgres' UniqueViolation."""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    return (
+        name in ("IntegrityError", "UniqueViolation", "UniqueViolationError")
+        or "unique constraint" in text
+        or "duplicate key" in text
+        or "unique failed" in text
+    )
+
+
 def _pg_sql(sql: str) -> str:
     """Translate the handful of SQLite-isms we use into Postgres."""
     out = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "SERIAL PRIMARY KEY", sql, flags=re.I)
@@ -641,6 +653,13 @@ class _PGConn:
         try:
             cur.execute(stmt, params if params else None)
         except Exception:
+            # The failed statement aborts the transaction in Postgres, so we must
+            # roll back before touching the connection again — otherwise the real
+            # error is replaced by a confusing InFailedSqlTransaction.
+            try:
+                self._raw.rollback()
+            except Exception:
+                pass
             if "RETURNING id" in stmt:
                 cur = self._raw.cursor()
                 cur.execute(stmt.replace(" RETURNING id", ""), params if params else None)
@@ -2287,7 +2306,9 @@ def register(body: RegisterRequest):
                 "SELECT id, name, email, is_admin, created_at FROM users WHERE id = ?",
                 (uid,),
             ).fetchone()
-    except sqlite3.IntegrityError:
+    except Exception as exc:
+        if not _is_duplicate_error(exc):
+            raise
         raise HTTPException(status_code=409, detail="An account with this email already exists. Please log in.")
 
     user_obj = serialize_user(row)
