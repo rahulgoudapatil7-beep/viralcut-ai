@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-26-db-guard"
+BUILD_TAG = "2026-11-27-stable-session"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -325,6 +325,9 @@ UPLOADS_DIR = DATA_DIR / "uploads"
 FFMPEG_DIR = BASE_DIR / "ffmpeg_bin"
 DB_PATH = DATA_DIR / "viralcut.db"
 SECRET_PATH = DATA_DIR / ".auth_secret"
+
+# Read the DB URL early — the JWT secret helper below needs it.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 COOKIES_PATH = DATA_DIR / "cookies.txt"
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 
@@ -516,10 +519,50 @@ FONT_FILE, FONT_NAME = FONTS["indic"]
 # DATABASE & AUTH HELPERS (Built-in SQLite + PBKDF2 + HMAC)
 # ============================================================
 def get_secret_key() -> bytes:
+    """Stable JWT signing key.
+
+    Order of preference:
+      1. AUTH_SECRET env var (best: never changes, survives everything)
+      2. Stored in the database (survives Render restarts when Postgres is used)
+      3. A local file (last resort on free hosting: rotates on every restart,
+         which logs everybody out)
+    """
+    env_secret = os.getenv("AUTH_SECRET", "").strip()
+    if env_secret:
+        return hashlib.sha256(env_secret.encode("utf-8")).digest()
+
+    if DATABASE_URL and psycopg is not None:
+        try:
+            with get_db() as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                row = conn.execute(
+                    "SELECT value FROM app_settings WHERE key = ?", ("jwt_secret",)
+                ).fetchone()
+                if row and row["value"]:
+                    return bytes.fromhex(row["value"])
+                new_key = secrets.token_bytes(32)
+                conn.execute(
+                    "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+                    ("jwt_secret", new_key.hex()),
+                )
+                row = conn.execute(
+                    "SELECT value FROM app_settings WHERE key = ?", ("jwt_secret",)
+                ).fetchone()
+                if row and row["value"]:
+                    print("[AUTH] JWT secret loaded from the database (stable across restarts)")
+                    return bytes.fromhex(row["value"])
+        except Exception as exc:
+            print(f"[AUTH] could not use DB for the signing key ({str(exc)[:120]}); using a local file")
+
     if SECRET_PATH.exists():
         return SECRET_PATH.read_bytes()
     key = secrets.token_bytes(32)
-    SECRET_PATH.write_bytes(key)
+    try:
+        SECRET_PATH.write_bytes(key)
+    except Exception:
+        pass
     return key
 
 
@@ -531,7 +574,6 @@ SECRET_KEY = get_secret_key()
 # deleted every account and project ("incorrect password" -> register again).
 # If DATABASE_URL is set (free Neon / Supabase / Render Postgres) we store
 # everything there instead. All existing SQLite-style SQL keeps working.
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_WARNING = ""
 if DATABASE_URL and psycopg is None:
     DB_WARNING = (
@@ -589,7 +631,11 @@ class _PGConn:
     def execute(self, sql: str, params=()):
         stmt = _pg_sql(sql).strip().rstrip(";")
         lowered = stmt.lower()
-        if lowered.startswith("insert") and "returning" not in lowered:
+        if (
+            lowered.startswith("insert")
+            and "returning" not in lowered
+            and "on conflict" not in lowered
+        ):
             stmt = stmt + " RETURNING id"
         cur = self._raw.cursor()
         try:
@@ -663,6 +709,9 @@ def get_db():
 
 def init_db() -> None:
     with get_db() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
