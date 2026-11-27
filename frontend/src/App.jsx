@@ -1196,6 +1196,21 @@ export default function App() {
                 </div>
               </div>
 
+              {health && health.db_mode === "sqlite-ephemeral" && (
+                <div
+                  className="alert error mt-12"
+                  style={{ alignItems: "flex-start", lineHeight: 1.55 }}
+                >
+                  <AlertCircle size={16} style={{ marginTop: 3, flexShrink: 0 }} />
+                  <span>
+                    <strong>Accounts can disappear on the free server.</strong> Render wipes its
+                    disk whenever the app sleeps or redeploys, so a login can fail later and users
+                    look "new" again. Fix: add a free Postgres URL (<code>DATABASE_URL</code>) in
+                    Render → Environment. See Settings for details.
+                  </span>
+                </div>
+              )}
+
               <div className="hero-subrow">
                 <small>
                   Auto-generates Viral Title, Description &amp; Hashtags · 1080p smooth export · Max upload{" "}
@@ -1851,6 +1866,22 @@ export default function App() {
                   <User size={18} /> Account Details
                 </h3>
                 <div className="kv-list">
+                  <div className="kv-row">
+                    <span>Database</span>
+                    <strong>
+                      {health?.db_mode === "postgres"
+                        ? "Postgres (persistent) ✅"
+                        : "Local SQLite (wiped on restart) ⚠️"}
+                    </strong>
+                  </div>
+                  <div className="kv-row">
+                    <span>Auto captions (Whisper)</span>
+                    <strong>
+                      {health?.auto_captions
+                        ? `ON (${health?.whisper_model || "tiny"} model)`
+                        : "OFF — upload a .srt instead"}
+                    </strong>
+                  </div>
                   <div>
                     <span>Name</span>
                     <strong>{user.name}</strong>

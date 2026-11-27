@@ -26,6 +26,11 @@ from typing import Any
 import httpx
 import imageio_ffmpeg
 import yt_dlp
+
+try:  # optional: only needed when DATABASE_URL is set
+    import psycopg
+except Exception:  # pragma: no cover
+    psycopg = None
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -311,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-25-float-fix"
+BUILD_TAG = "2026-11-26-captions-db"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -521,8 +526,106 @@ def get_secret_key() -> bytes:
 SECRET_KEY = get_secret_key()
 
 
+# ---------------- DATABASE ----------------
+# Render's free disk is wiped every time the instance restarts or sleeps, which
+# deleted every account and project ("incorrect password" -> register again).
+# If DATABASE_URL is set (free Neon / Supabase / Render Postgres) we store
+# everything there instead. All existing SQLite-style SQL keeps working.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_MODE = "postgres" if DATABASE_URL else "sqlite-ephemeral"
+
+
+def _pg_sql(sql: str) -> str:
+    """Translate the handful of SQLite-isms we use into Postgres."""
+    out = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "SERIAL PRIMARY KEY", sql, flags=re.I)
+    m = re.match(r"\s*PRAGMA\s+table_info\(\s*['\"]?(\w+)['\"]?\s*\)", out, re.I)
+    if m:
+        return (
+            "SELECT column_name AS name FROM information_schema.columns "
+            f"WHERE table_name = '{m.group(1)}'"
+        )
+    return out.replace("?", "%s")
+
+
+class _PGCursor:
+    def __init__(self, cur):
+        self._cur = cur
+        self._lastrowid = None
+        self._rowid_read = False
+
+    @property
+    def lastrowid(self):
+        if not self._rowid_read:
+            self._rowid_read = True
+            try:
+                row = self._cur.fetchone()
+                if row:
+                    self._lastrowid = row.get("id") if isinstance(row, dict) else row[0]
+            except Exception:
+                self._lastrowid = None
+        return self._lastrowid
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def __iter__(self):
+        return iter(self._cur.fetchall())
+
+
+class _PGConn:
+    def __init__(self, raw):
+        self._raw = raw
+
+    def execute(self, sql: str, params=()):
+        stmt = _pg_sql(sql).strip().rstrip(";")
+        lowered = stmt.lower()
+        if lowered.startswith("insert") and "returning" not in lowered:
+            stmt = stmt + " RETURNING id"
+        cur = self._raw.cursor()
+        try:
+            cur.execute(stmt, params if params else None)
+        except Exception:
+            if "RETURNING id" in stmt:
+                cur = self._raw.cursor()
+                cur.execute(stmt.replace(" RETURNING id", ""), params if params else None)
+            else:
+                raise
+        return _PGCursor(cur)
+
+    def executescript(self, script: str):
+        for part in [p.strip() for p in script.split(";") if p.strip()]:
+            self.execute(part)
+
+    def commit(self):
+        self._raw.commit()
+
+    def close(self):
+        self._raw.close()
+
+
 @contextmanager
 def get_db():
+    if DATABASE_URL:
+        from psycopg.rows import dict_row
+
+        raw = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        conn = _PGConn(raw)
+        try:
+            yield conn
+            raw.commit()
+        except Exception:
+            try:
+                raw.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            raw.close()
+        return
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
@@ -2053,6 +2156,9 @@ def health(proxy: int = 0):
         "youtube_cookies_loaded": bool(YOUTUBE_COOKIE_FILE and Path(YOUTUBE_COOKIE_FILE).exists()),
         "youtube_cookies_count": YOUTUBE_COOKIES_COUNT,
         "youtube_auth_cookies_ok": YOUTUBE_AUTH_COOKIES_OK,
+        "db_mode": DB_MODE,
+        "auto_captions": _whisper_available(),
+        "whisper_model": WHISPER_MODEL_SIZE,
         "proxy_configured": bool(PROXY_URL),
         "active_proxy": _mask_proxy(get_active_proxy()) if get_active_proxy() else None,
         "free_proxy_pool": {
@@ -2477,6 +2583,122 @@ def analyze_video(body: AnalyzeRequest, user: dict[str, Any] = Depends(get_curre
             "created_at": now,
         }
     }
+
+
+# ---------------- AUTO CAPTIONS (offline Whisper) ----------------
+# Uploads rarely come with .srt files, so the "Captions: ON" toggle had nothing to
+# burn. We now transcribe the clip's own audio (30-60s) at cut time with
+# faster-whisper's tiny model — fast even on a 0.1 CPU, no API key needed.
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "tiny")
+# Free hosting has 512 MB RAM. The tiny model peaks around ~330 MB, so by default we
+# drop it right after transcribing — FFmpeg then gets the memory back for encoding.
+WHISPER_KEEP_LOADED = os.getenv("WHISPER_KEEP_LOADED", "0").strip().lower() in ("1", "true", "yes")
+_WHISPER = None
+_WHISPER_locked_off = False
+_WHISPER_LOCK = threading.Lock()
+
+
+def _whisper_model():
+    global _WHISPER, _WHISPER_locked_off
+    with _WHISPER_LOCK:
+        if _WHISPER is not None:
+            return _WHISPER
+        if _WHISPER_locked_off:
+            return None
+        try:
+            from faster_whisper import WhisperModel
+
+            cache = DATA_DIR / "whisper"
+            cache.mkdir(parents=True, exist_ok=True)
+            print(f"[ASR] loading whisper '{WHISPER_MODEL_SIZE}' (first time downloads ~75 MB)...")
+            _WHISPER = WhisperModel(
+                WHISPER_MODEL_SIZE,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=2,
+                download_root=str(cache),
+            )
+            print("[ASR] whisper ready")
+        except Exception as exc:
+            print(f"[ASR] auto-captions unavailable ({exc}); .srt upload still works")
+            _WHISPER_locked_off = True
+            _WHISPER = None
+        return _WHISPER
+
+
+def _unload_whisper() -> None:
+    global _WHISPER
+    with _WHISPER_LOCK:
+        if _WHISPER is not None:
+            _WHISPER = None
+            import gc
+            gc.collect()
+            print("[ASR] model unloaded to free RAM")
+
+
+def _whisper_available() -> bool:
+    try:
+        import faster_whisper  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def transcribe_video_section(video_path: Path, start: float, end: float) -> list[dict[str, Any]]:
+    """Transcribe just [start, end] of a local video -> transcript segments (absolute times)."""
+    model = _whisper_model()
+    if model is None or not FFMPEG_BIN or not video_path.exists():
+        return []
+    try:
+        import numpy as np
+    except Exception as exc:
+        print(f"[ASR] numpy missing: {exc}")
+        return []
+
+    pad = 0.4
+    base = max(0.0, float(start) - pad)
+    dur = max(1.0, float(end) - float(start) + pad * 2)
+    try:
+        raw = subprocess.run(
+            [
+                FFMPEG_BIN, "-v", "quiet", "-nostdin",
+                "-ss", f"{base:.2f}", "-t", f"{dur:.2f}",
+                "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000",
+                "-f", "s16le", "-",
+            ],
+            capture_output=True, timeout=300,
+        ).stdout
+    except Exception as exc:
+        print(f"[ASR] audio extract failed: {exc}")
+        return []
+    if not raw or len(raw) < 8000:
+        return []
+
+    try:
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        segments, info = model.transcribe(
+            audio, vad_filter=True, beam_size=1, condition_on_previous_text=False
+        )
+        out: list[dict[str, Any]] = []
+        for seg in segments:
+            text = (seg.text or "").strip()
+            if not text:
+                continue
+            out.append(
+                {
+                    "start": round(base + float(seg.start), 2),
+                    "duration": round(max(0.4, float(seg.end) - float(seg.start)), 2),
+                    "text": text,
+                }
+            )
+        print(f"[ASR] transcribed {dur:.0f}s -> {len(out)} segments (lang={getattr(info, 'language', '?')})")
+        return out
+    except Exception as exc:
+        print(f"[ASR] transcribe failed: {exc}")
+        return []
+    finally:
+        if not WHISPER_KEEP_LOADED:
+            _unload_whisper()
 
 
 def probe_local_duration(video_path: Path) -> float:
@@ -3103,8 +3325,14 @@ def _perform_cut(
             )
         elif str(proj["url"]).startswith("upload://"):
             fname = str(proj["url"]).replace("upload://", "", 1)
+            local_src = UPLOADS_DIR / Path(fname).name
+            # Captions ON but no .srt uploaded? Transcribe the clip's own audio.
+            if body.captions and not transcript:
+                if callable(progress):
+                    progress("No subtitle file found — auto-generating captions from the audio...")
+                transcript = transcribe_video_section(local_src, body.start, body.end)
             out_path, has_cc, note = cut_uploaded_section(
-                UPLOADS_DIR / Path(fname).name,
+                local_src,
                 proj["video_id"],
                 body.start,
                 body.end,
