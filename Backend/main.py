@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-27-register-fix"
+BUILD_TAG = "2026-11-27-viral-tdh"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -1285,6 +1285,156 @@ def extract_topic_hashtags(video_title: str, lang: str = "en") -> list[str]:
     return tags[:8]
 
 
+
+# ---------------- VIRAL TITLE / DESCRIPTION / HASHTAGS ENGINE ----------------
+DOWNLOAD_JUNK = re.compile(
+    r"(?i)\b(?:www\.)?[a-z0-9][a-z0-9-]{1,30}\.(?:com|in|net|org|co|io|me|link|site|xyz|top|club|vip|"
+    r"app|tv|cc|info|biz|ru|to|ws|fm|ly|gg|sh|online|store|pro|live)\b"
+)
+SITE_MARKERS = re.compile(
+    r"(?i)\b(?:vidssave|savefrom|ssyoutube|y2mate|yt5s|snaptik|ssstik|9xbuddy|"
+    r"ytmp3|y2down|download|downloaded|mp3converter|converter|hdhub|9xmovies|filmyzilla)\b"
+)
+RESOLUTION_TAG = re.compile(r"(?i)\b(?:144|240|360|480|540|720|1080|1440|2160|4k|8k)\s*p?\b")
+BRACKET_TAG = re.compile(r"[\[\(\{][^\]\)\}]{0,24}[\]\)\}]")
+EMOJI_RE = re.compile(
+    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF\U00002B00-\U00002BFF]+",
+    flags=re.UNICODE,
+)
+TITLE_NOISE = {
+    "video", "videos", "full", "hd", "hq", "mp4", "mkv", "new", "latest", "official",
+    "watch", "download", "free", "song", "movie", "whatsapp", "status", "clip", "clips",
+}
+
+
+def clean_source_topic(raw: str) -> str:
+    """Turn a messy filename or video title into a clean topic.
+
+    'vidssave.com I Tested 25 Lakh Defender Reality 480P' -> 'I Tested 25 Lakh Defender Reality'
+    """
+    if not raw:
+        return "This clip"
+    text = str(raw)
+    text = re.sub(r"\.(?:mp4|mov|mkv|webm|m4v|avi|flv|ts)$", " ", text, flags=re.I)
+    text = DOWNLOAD_JUNK.sub(" ", text)
+    text = SITE_MARKERS.sub(" ", text)
+    text = re.sub(r"https?://\S+", " ", text)
+    text = BRACKET_TAG.sub(" ", text)
+    text = RESOLUTION_TAG.sub(" ", text)
+    text = EMOJI_RE.sub(" ", text)
+    text = text.replace("_", " ").replace("|", " ").replace("\u2022", " ")
+    text = re.sub(r"\s{2,}", " ", text).strip(" -\u2013\u2014:.|,")
+    words = [w for w in text.split() if w.lower().strip(".,!?") not in TITLE_NOISE]
+    text = " ".join(words).strip()
+    text = re.sub(r"\bi\b", "I", text)
+    return text[:90].strip() or "This clip"
+
+
+def _topic_keywords(text: str, limit: int = 3) -> list[str]:
+    """Pull the most meaningful words out of a topic or spoken line."""
+    if not text:
+        return []
+    words = re.findall(r"[A-Za-z\u0900-\u097F][\w'\u0900-\u097F]{2,}", str(text))
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for w in words:
+        low = w.lower()
+        if low in STOP_WORDS or low in TITLE_NOISE or low.isdigit():
+            continue
+        if low not in counts:
+            order.append(w)
+        counts[low] = counts.get(low, 0) + 1
+    ranked = sorted(order, key=lambda w: (-len(w), -counts[w.lower()], order.index(w)))
+    return ranked[:limit]
+
+
+def _clean_speech(text: str, max_words: int = 10) -> str:
+    txt = re.sub(r"\s+", " ", EMOJI_RE.sub(" ", str(text or ""))).strip()
+    txt = re.sub(r"\b(?:um+|uh+|like|you know|so yeah)\b[, ]*", " ", txt, flags=re.I)
+    words = txt.split()
+    if not words:
+        return ""
+    return " ".join(words[:max_words]).strip(" ,;:-")
+
+
+def build_viral_tdh(
+    topic: str,
+    spoken_text: str = "",
+    rank: int = 1,
+    duration_sec: float = 30.0,
+    lang: str = "en",
+) -> dict[str, Any]:
+    """Human-quality Title / Description / Hashtags for a Short or Reel."""
+    clean_topic = clean_source_topic(topic)
+    kw = _topic_keywords(clean_topic, 4)
+    # Short, readable subject phrase (what the title is actually about)
+    short_topic = clean_topic
+    if len(short_topic) > 52:
+        cut = short_topic[:52].rsplit(" ", 1)[0]
+        short_topic = cut.rstrip(" ,;:-")
+    short_topic = short_topic[:1].upper() + short_topic[1:] if short_topic else "This clip"
+
+    # Best single keyword for hashtags / CTA (prefer specific + long words)
+    specific = [w for w in kw if len(w) >= 4]
+    focus = max(specific, key=len).title() if specific else (kw[0].title() if kw else "Viral")
+    quote = _clean_speech(spoken_text, 7)
+
+    quote_templates = [
+        '"{q}" \U0001F92F',
+        "Wait for it\u2026 \u201c{q}\u201d \U0001F631",
+        'He actually said: "{q}" \U0001F525',
+        '"{q}" \u2014 this is going viral',
+        'Nobody expected this: "{q}" \U0001F62E',
+    ]
+    topic_templates = [
+        "Wait for it\u2026 {t} \U0001F631",
+        "{t} \u2014 you won't believe this \U0001F525",
+        "Nobody expected this: {t} \U0001F62E",
+        "{t} \U0001F92F (watch till the end)",
+        "You have to see this: {t} \U0001F440",
+    ]
+    if quote and len(quote.split()) >= 3:
+        title = quote_templates[(rank - 1) % len(quote_templates)].format(q=quote)
+    else:
+        title = topic_templates[(rank - 1) % len(topic_templates)].format(t=short_topic)
+    title = re.sub(r"\s{2,}", " ", title).strip()
+    if len(title) > 95:
+        title = title[:92].rstrip(" ,;:-") + "\u2026"
+
+    hashtags: list[str] = []
+    seen: set[str] = set()
+    tag_words = [w for w in kw if w.lower() not in {"tested", "moment", "viral", "highlight", "going", "part", "reality", "upcoming"}]
+    for w in (tag_words or kw):
+        tag = "#" + re.sub(r"[^\w\u0900-\u097F]", "", w).title()
+        if len(tag) > 3 and tag.lower() not in seen:
+            seen.add(tag.lower())
+            hashtags.append(tag)
+    platform = ["#Shorts", "#Reels", "#Viral", "#Trending", "#Explore", "#FYP", "#ViralClips"]
+    if str(lang).lower().startswith("hi"):
+        platform.insert(1, "#HindiShorts")
+    for p in platform:
+        if p.lower() not in seen:
+            seen.add(p.lower())
+            hashtags.append(p)
+    hashtags = hashtags[:8]
+
+    if quote:
+        context_line = short_topic + ' \u2014 the moment they said: "' + quote + '"'
+    else:
+        context_line = short_topic + " \u2014 the " + str(int(round(duration_sec))) + "s highlight everyone is sharing."
+
+    description = "\n".join(
+        [
+            title,
+            context_line,
+            "\u27A1\uFE0F Follow for more " + focus + " clips like this",
+            "\U0001F4CC Save this & comment what you think!",
+            "",
+            " ".join(hashtags[:5]),
+        ]
+    )
+    return {"viral_title": title, "description": description, "hashtags": hashtags}
+
 def generate_clip_metadata(
     video_title: str,
     snippet_text: str,
@@ -1293,6 +1443,22 @@ def generate_clip_metadata(
     lang: str = "en",
 ) -> dict[str, Any]:
     """Generate a ready-to-post viral Title, Description, and Hashtags for every clip."""
+    return build_viral_tdh(
+        topic=video_title,
+        spoken_text="" if snippet_text.lower().startswith("high-energy highlight") else snippet_text,
+        rank=rank,
+        duration_sec=duration_sec,
+        lang=lang,
+    )
+
+
+def _legacy_generate_clip_metadata(
+    video_title: str,
+    snippet_text: str,
+    rank: int,
+    duration_sec: float,
+    lang: str = "en",
+) -> dict[str, Any]:
     clean_snip = re.sub(r"\s+", " ", snippet_text).strip()
     clean_vtitle = re.sub(r"\s+", " ", video_title).strip()
     short_vtitle = clean_vtitle[:54].rstrip(" |-:")
@@ -2086,6 +2252,7 @@ class AnalyzeRequest(BaseModel):
 
 
 class CutClipRequest(BaseModel):
+    auto_text: bool = True
     project_id: int
     start: float
     end: float
@@ -3404,6 +3571,27 @@ def _job_update(job_id: str, **fields: Any) -> None:
             job["updated_at"] = time.time()
 
 
+def _spoken_for_range(
+    transcript: list[dict[str, Any]], start: float, end: float, max_chars: int = 400
+) -> str:
+    """Join the spoken words that fall inside [start, end]."""
+    if not transcript:
+        return ""
+    parts: list[str] = []
+    for seg in transcript:
+        try:
+            s_start = float(seg.get("start", 0.0))
+        except Exception:
+            continue
+        if start - 0.5 <= s_start <= end + 0.5:
+            text = str(seg.get("text", "")).strip()
+            if text:
+                parts.append(text)
+        if sum(len(p) for p in parts) > max_chars:
+            break
+    return re.sub(r"\s+", " ", " ".join(parts))[:max_chars].strip()
+
+
 def _perform_cut(
     body: "CutClipRequest",
     user: dict[str, Any],
@@ -3453,6 +3641,25 @@ def _perform_cut(
         raise
     except Exception as exc:
         raise RuntimeError(str(exc))
+
+    # ---- Rebuild Title/Description/Hashtags from THIS clip's own speech ----
+    try:
+        if bool(getattr(body, "auto_text", True)):
+            spoken = _spoken_for_range(transcript, body.start, body.end)
+            if spoken:
+                meta = build_viral_tdh(
+                    topic=proj["title"] or "",
+                    spoken_text=spoken,
+                    rank=1,
+                    duration_sec=max(1.0, body.end - body.start),
+                    lang=proj["language"] or "en",
+                )
+                body.title = meta["viral_title"]
+                body.description = meta["description"]
+                body.hashtags = meta["hashtags"]
+                print(f"[TDH] clip text from speech: {body.title[:70]}")
+    except Exception as exc:
+        print(f"[TDH] rewrite skipped: {exc}")
 
     now = datetime.now(timezone.utc).isoformat()
     quality = f"{MAX_HEIGHT}p"
@@ -3552,9 +3759,7 @@ def _perform_upload(
         raise RuntimeError("Could not read the video duration — is the file a valid MP4/MOV?")
 
     _p(f"Analysing {duration/60:.1f} min of audio for high-energy moments...")
-    clean_title = (
-        Path(orig_name).stem.replace("_", " ").replace("-", " ").strip() or "Uploaded Video"
-    )
+    clean_title = clean_source_topic(Path(orig_name).stem) or "Uploaded Video"
     try:
         suggestions = detect_uploaded_video_moments(
             saved_path, duration, clip_length, max_clips, clean_title
