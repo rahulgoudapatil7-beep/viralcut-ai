@@ -9,13 +9,15 @@ RUN npm run build
 FROM python:3.12-slim
 WORKDIR /app
 
-# Install FFmpeg, Node.js (for yt-dlp JS runtime), and Hindi/Devanagari + Latin fonts
+# Install FFmpeg, Node.js (for yt-dlp JS runtime), Hindi/Devanagari + Latin fonts.
+# libgomp1 is REQUIRED by ctranslate2/onnxruntime (the Whisper auto-caption engine).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     nodejs \
     fontconfig \
     fonts-noto-core \
     fonts-dejavu-core \
+    libgomp1 \
     ca-certificates \
     && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
@@ -26,14 +28,15 @@ RUN if [ -d /tmp/repo/Backend ]; then cp -r /tmp/repo/Backend /app/backend; \
     else cp -r /tmp/repo/backend /app/backend; fi \
     && rm -rf /tmp/repo /app/backend/venv /app/backend/ffmpeg_bin /app/backend/clips /app/backend/node_modules
 
-RUN pip install --no-cache-dir \
-    fastapi \
-    uvicorn \
-    python-multipart \
-    "yt-dlp[default]" \
-    youtube-transcript-api \
-    imageio-ffmpeg \
-    httpx
+# Install Python deps FROM requirements.txt (single source of truth).
+# This is what was missing: psycopg (permanent accounts) + faster-whisper (auto captions).
+RUN if [ -f /app/backend/requirements.txt ]; then \
+        pip install --no-cache-dir -r /app/backend/requirements.txt; \
+    else \
+        echo "requirements.txt not found — installing minimal set" && \
+        pip install --no-cache-dir fastapi uvicorn python-multipart "yt-dlp[default]" \
+            youtube-transcript-api imageio-ffmpeg httpx; \
+    fi
 
 # Copy built React app into /app/frontend/dist so FastAPI serves it at /
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
