@@ -316,12 +316,13 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-28-word-sync-captions"
+BUILD_TAG = "2026-11-29-real-thumbnails"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
 CLIPS_DIR = DATA_DIR / "clips"
 UPLOADS_DIR = DATA_DIR / "uploads"
+THUMBS_DIR = DATA_DIR / "thumbs"
 FFMPEG_DIR = BASE_DIR / "ffmpeg_bin"
 DB_PATH = DATA_DIR / "viralcut.db"
 SECRET_PATH = DATA_DIR / ".auth_secret"
@@ -334,6 +335,7 @@ FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+THUMBS_DIR.mkdir(parents=True, exist_ok=True)
 FFMPEG_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -730,6 +732,9 @@ def init_db() -> None:
     with get_db() as conn:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS project_thumbs (project_id INTEGER PRIMARY KEY, jpeg_b64 TEXT NOT NULL)"
         )
         conn.executescript(
             """
@@ -1422,6 +1427,80 @@ def _build_hashtags(topic: str, spoken: str, lang: str, limit: int = 12) -> list
     return tags[:limit]
 
 
+def _llm_json_call(user_prompt: str, description: bool = True) -> dict[str, Any] | None:
+    """One JSON-mode LLM call (Groq or Gemini). Returns the parsed dict or None."""
+    if not llm_tdh_enabled():
+        return None
+    system = TDH_SYSTEM_PROMPT if description else (
+        "You name videos for a shorts app. Answer with a single JSON object."
+    )
+    try:
+        if GROQ_API_KEY:
+            r = httpx.post(
+                f"{GROQ_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL_NAME,
+                    "messages": [{"role": "system", "content": system},
+                                 {"role": "user", "content": user_prompt}],
+                    "temperature": 0.8, "max_tokens": 700,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=LLM_TIMEOUT,
+            )
+            r.raise_for_status()
+            raw = r.json()["choices"][0]["message"]["content"]
+        else:
+            r = httpx.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent",
+                params={"key": GEMINI_API_KEY},
+                json={"contents": [{"parts": [{"text": system + "\n\n" + user_prompt}]}],
+                      "generationConfig": {"temperature": 0.85, "maxOutputTokens": 900,
+                                           "responseMimeType": "application/json"}},
+                timeout=LLM_TIMEOUT,
+            )
+            r.raise_for_status()
+            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        raw = (raw or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", raw).strip()
+        i, j = raw.find("{"), raw.rfind("}")
+        if i >= 0 and j > i:
+            raw = raw[i:j + 1]
+        return json.loads(raw)
+    except Exception as exc:
+        print(f"[TDH] LLM call failed ({type(exc).__name__}: {str(exc)[:120]})")
+        return None
+
+
+def _is_generic_title(title: str) -> bool:
+    t = (title or "").strip()
+    return (
+        not t
+        or t.lower() in ("this clip", "uploaded video", "video", "untitled")
+        or bool(re.fullmatch(r"[\d\s._-]+", t))
+    )
+
+
+def _llm_video_title(spoken: str) -> str | None:
+    """Name a whole video from what is actually said in it."""
+    if not spoken:
+        return None
+    data = _llm_json_call(
+        "Give this video one catchy title for a shorts app.\n"
+        f'Transcript: """{spoken[:900]}"""\n'
+        "Rules: max 60 characters, no quotes, no hashtags, describe the actual subject.\n"
+        'Return ONLY JSON: {"title": "..."}',
+        description=False,
+    )
+    if not data:
+        return None
+    title = str(data.get("title", "")).strip().strip('"').replace("\n", " ")
+    if len(title) < 4:
+        return None
+    return title[:80]
+
+
 def _llm_tdh(topic: str, spoken: str, duration_sec: float, lang: str) -> dict[str, Any] | None:
     """Ask a free LLM (Groq/Gemini) for real, human-quality metadata."""
     if not llm_tdh_enabled():
@@ -1433,7 +1512,7 @@ def _llm_tdh(topic: str, spoken: str, duration_sec: float, lang: str) -> dict[st
         f"Clip length: {int(round(duration_sec))} seconds.\n"
         f"Original video context: {topic}\n"
         f"Spoken content of THIS clip (automatic transcript, may contain small errors):\n"
-        f"\"\"\"{spoken[:1200] or '(no speech — silent or music-only clip)'}\"\"\"\n"
+        f"\"\"\"{spoken[:1200] or '(no speech - silent or music-only clip)'}\"\"\"\n"
         f"Language of the speech: {lang_name}\n\n"
         "Rules:\n"
         "- title: max 80 characters, a real hook that matches what is actually said. No lies, no ALL CAPS spam, 0-2 emojis max.\n"
@@ -1444,68 +1523,31 @@ def _llm_tdh(topic: str, spoken: str, duration_sec: float, lang: str) -> dict[st
         "#Shorts #Reels #Viral #Trending. camelCase words, no spaces.\n"
         'Return ONLY JSON: {"title": "...", "description": "...", "hashtags": ["#a", "#b"]}'
     )
-    payload = {"model": GROQ_MODEL_NAME,
-               "messages": [{"role": "system", "content": TDH_SYSTEM_PROMPT},
-                            {"role": "user", "content": user_prompt}],
-               "temperature": 0.8, "max_tokens": 700,
-               "response_format": {"type": "json_object"}}
-    try:
-        if GROQ_API_KEY:
-            r = httpx.post(
-                f"{GROQ_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json=payload, timeout=LLM_TIMEOUT,
-            )
-            r.raise_for_status()
-            raw = r.json()["choices"][0]["message"]["content"]
-        else:
-            gpayload = {
-                "contents": [{"parts": [{"text": TDH_SYSTEM_PROMPT + "\n\n" + user_prompt}]}],
-                "generationConfig": {"temperature": 0.85, "maxOutputTokens": 900,
-                                     "responseMimeType": "application/json"},
-            }
-            r = httpx.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent",
-                params={"key": GEMINI_API_KEY}, json=gpayload, timeout=LLM_TIMEOUT,
-            )
-            r.raise_for_status()
-            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", raw).strip()
-        start_i, end_i = raw.find("{"), raw.rfind("}")
-        if start_i >= 0 and end_i > start_i:
-            raw = raw[start_i:end_i + 1]
-        data = json.loads(raw)
-
-        title = str(data.get("title", "")).strip()
-        desc = str(data.get("description", "")).strip()
-        tags_in = data.get("hashtags") or []
-        if isinstance(tags_in, str):
-            tags_in = re.split(r"[,\s]+", tags_in)
-        tags: list[str] = []
-        seen: set[str] = set()
-        for t in tags_in:
-            t = re.sub(r"[^\w\u0900-\u097F#]", "", str(t)).lstrip("#")
-            if len(t) < 3:
-                continue
-            tag = "#" + t[0].upper() + t[1:]
-            if tag.lower() not in seen:
-                seen.add(tag.lower())
-                tags.append(tag)
-        if not title or not desc:
-            return None
-        if len(title) > 100:
-            title = title[:97].rstrip(" ,;:-") + "\u2026"
-        if len(tags) < 6:
-            return None
-        print(f"[TDH] {llm_backend()} wrote: {title[:60]}")
-        return {"viral_title": title, "description": desc, "hashtags": tags[:12]}
-    except Exception as exc:
-        print(f"[TDH] LLM unavailable ({type(exc).__name__}: {str(exc)[:120]}) — using template engine")
+    data = _llm_json_call(user_prompt)
+    if not data:
         return None
 
+    title = str(data.get("title", "")).strip()
+    desc = str(data.get("description", "")).strip()
+    tags_in = data.get("hashtags") or []
+    if isinstance(tags_in, str):
+        tags_in = re.split(r"[,\s]+", tags_in)
+    tags: list[str] = []
+    seen: set[str] = set()
+    for t in tags_in:
+        t = re.sub(r"[^\w\u0900-\u097F#]", "", str(t)).lstrip("#")
+        if len(t) < 3:
+            continue
+        tag = "#" + t[0].upper() + t[1:]
+        if tag.lower() not in seen:
+            seen.add(tag.lower())
+            tags.append(tag)
+    if not title or not desc or len(tags) < 6:
+        return None
+    if len(title) > 100:
+        title = title[:97].rstrip(" ,;:-") + "\u2026"
+    print(f"[TDH] {llm_backend()} wrote: {title[:60]}")
+    return {"viral_title": title, "description": desc, "hashtags": tags[:12]}
 
 def build_viral_tdh(
     topic: str,
@@ -2331,6 +2373,8 @@ def create_demo_project_for_user(user_id: int) -> dict[str, Any]:
         )
         proj_id = cur.lastrowid
 
+
+
     return {
         "id": proj_id,
         "video_id": demo_vid,
@@ -2892,7 +2936,7 @@ def get_workspace(user: dict[str, Any] = Depends(get_current_user)):
                 "video_id": p["video_id"],
                 "url": p["url"],
                 "title": p["title"],
-                "thumbnail": p["thumbnail"],
+                "thumbnail": p["thumbnail"] or _project_thumbnail_url(p),
                 "duration": p["duration"],
                 "language": p["language"],
                 "top_score": p["top_score"],
@@ -4217,7 +4261,12 @@ def _perform_upload(
                 sug["title"] = meta_tdh["viral_title"]
                 sug["description"] = meta_tdh["description"]
                 sug["hashtags"] = meta_tdh["hashtags"]
-            print(f"[UPLOAD] TDH grounded in speech for {sum(1 for s in suggestions if s.get('description'))} clips")
+            if _is_generic_title(clean_title):
+                better = _llm_video_title(_spoken_for_range(heard, 0, cap))
+                if better:
+                    print(f"[UPLOAD] video renamed: {clean_title!r} -> {better!r}")
+                    clean_title = better
+            print(f"[UPLOAD] TDH grounded in speech for {len(suggestions)} clips")
         else:
             _p("Could not hear clear speech — using topic-based titles.")
 
@@ -4240,12 +4289,34 @@ def _perform_upload(
         )
         proj_id = cur.lastrowid
 
+    # Poster frame -> Postgres, so the card still shows a picture after a restart.
+    try:
+        poster = THUMBS_DIR / f"p{proj_id}.jpg"
+        if _extract_poster(saved_path, poster, _poster_time_for_project({"suggestions_json": json.dumps(suggestions), "duration": duration})):
+            import base64 as _b64
+            b64 = _b64.b64encode(poster.read_bytes()).decode("ascii")
+            with get_db() as conn:
+                conn.execute(
+                    "INSERT INTO project_thumbs (project_id, jpeg_b64) VALUES (?, ?) "
+                    "ON CONFLICT (project_id) DO UPDATE SET jpeg_b64 = ?",
+                    (proj_id, b64, b64),
+                )
+                conn.execute(
+                    "UPDATE projects SET thumbnail = ? WHERE id = ?",
+                    (f"/api/poster/project/{proj_id}", proj_id),
+                )
+            print(f"[THUMB] poster saved for project {proj_id} ({len(b64)} b64 chars)")
+    except Exception as exc:
+        print(f"[THUMB] poster skipped: {exc}")
+
+    thumb_url = f"/api/poster/project/{proj_id}" if (THUMBS_DIR / f"p{proj_id}.jpg").exists() else None
+
     return {
         "id": proj_id,
         "video_id": saved_path.stem,
         "url": src_url,
         "title": clean_title,
-        "thumbnail": None,
+        "thumbnail": thumb_url,
         "duration": duration,
         "language": lang,
         "top_score": top_score,
@@ -4377,6 +4448,143 @@ def delete_project(project_id: int, user: dict[str, Any] = Depends(get_current_u
             if not still_used:
                 (UPLOADS_DIR / Path(fname).name).unlink(missing_ok=True)
     return {"deleted": True}
+
+
+def _extract_poster(src: Path, out: Path, at_sec: float) -> bool:
+    """Grab one JPEG frame from a video file (fast seek). True if it worked."""
+    if not FFMPEG_BIN or not src.exists():
+        return False
+    for t in (max(0.0, at_sec), max(0.0, at_sec / 2), 0.5):
+        try:
+            subprocess.run(
+                [
+                    FFMPEG_BIN, "-v", "error", "-nostdin",
+                    "-ss", f"{t:.2f}", "-i", str(src),
+                    "-frames:v", "1", "-vf", "scale=480:-2",
+                    "-q:v", "4", str(out), "-y",
+                ],
+                capture_output=True, timeout=90,
+            )
+        except Exception as exc:
+            print(f"[THUMB] extract failed: {exc}")
+            continue
+        if out.exists() and out.stat().st_size > 1500:
+            return True
+    return False
+
+
+def _placeholder_jpg() -> Path:
+    """A dark 480x270 frame so a card never shows a broken image."""
+    out = THUMBS_DIR / "_placeholder.jpg"
+    if out.exists() and out.stat().st_size > 500:
+        return out
+    if FFMPEG_BIN:
+        try:
+            subprocess.run(
+                [
+                    FFMPEG_BIN, "-v", "error", "-f", "lavfi",
+                    "-i", "color=c=0x14121f:s=480x270",
+                    "-frames:v", "1", "-q:v", "6", str(out), "-y",
+                ],
+                capture_output=True, timeout=45,
+            )
+        except Exception:
+            pass
+    if not out.exists():
+        # 1x1 dark JPEG
+        out.write_bytes(
+            bytes.fromhex(
+                "ffd8ffe000104a46494600010100000100010000ffdb00430008060607060508070"
+                "709070707090a0c140d0c0b0b0c1912130f141d1a1f1e1d1a1c1c20242e2720"
+                "222c231c1c28372c2c30313434341f27393d38323c2e333432ffc0000b0800010"
+                "0010101220002ffc4001f00000105010101010101000000000000000001020304"
+                "05060708090a0bffc40014100100000000000000000000000000000000ffda0008"
+                "01010000013fffc40014100100000000000000000000000000000000ffda00080"
+                "1010000013fffc40014100100000000000000000000000000000000ffda000801"
+                "010002013fffc40014100100000000000000000000000000000000ffda0008010"
+                "10000013fffc40014100100000000000000000000000000000000ffda00080106"
+                "00000101"
+            )
+        )
+    return out
+
+
+def _project_source_file(proj: Any) -> Path | None:
+    """Local file behind a project (uploads only)."""
+    try:
+        url = str(proj["url"] or "")
+    except Exception:
+        return None
+    if not url.startswith("upload://"):
+        return None
+    fname = url.replace("upload://", "", 1)
+    path = UPLOADS_DIR / Path(fname).name
+    return path if path.exists() else None
+
+
+def _project_thumbnail_url(proj: Any) -> str | None:
+    """URL for a project's poster frame, or None when there is no local video."""
+    if _project_source_file(proj) is None:
+        return None
+    return f"/api/poster/project/{proj['id']}"
+
+
+def _poster_time_for_project(proj: Any) -> float:
+    """Poster at the start of the best clip (falls back to 10% in)."""
+    try:
+        suggestions = json.loads(proj["suggestions_json"] or "[]")
+        if suggestions:
+            return max(0.0, float(suggestions[0]["start"]) + 1.5)
+    except Exception:
+        pass
+    try:
+        return max(0.5, float(proj["duration"] or 0) * 0.1)
+    except Exception:
+        return 1.0
+
+
+@app.get("/api/poster/project/{project_id}")
+def project_poster(project_id: int):
+    """JPEG poster frame for a project card (cached on disk)."""
+    from fastapi.responses import FileResponse
+
+    import base64 as _b64
+    from fastapi import Response
+
+    out = THUMBS_DIR / f"p{project_id}.jpg"
+    # 1) Stored in the database -> survives restarts and disk wipes.
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT jpeg_b64 FROM project_thumbs WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        if row and row["jpeg_b64"]:
+            return Response(content=_b64.b64decode(row["jpeg_b64"]), media_type="image/jpeg",
+                            headers={"Cache-Control": "public, max-age=86400"})
+    except Exception as exc:
+        print(f"[THUMB] db lookup failed: {exc}")
+
+    # 2) Already on disk.
+    if out.exists() and out.stat().st_size > 1500:
+        return FileResponse(out, media_type="image/jpeg",
+                            headers={"Cache-Control": "public, max-age=86400"})
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, url, duration, suggestions_json FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+    src = _project_source_file(row) if row else None
+    if src is None:
+        return FileResponse(_placeholder_jpg(), media_type="image/jpeg",
+                            headers={"Cache-Control": "public, max-age=600"})
+    at = _poster_time_for_project(row)
+    if _extract_poster(src, out, at):
+        return FileResponse(out, media_type="image/jpeg",
+                            headers={"Cache-Control": "public, max-age=86400"})
+    print(f"[THUMB] could not extract poster for project {project_id}")
+    return FileResponse(_placeholder_jpg(), media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=600"})
 
 
 @app.get("/api/clips/file/{filename}")
