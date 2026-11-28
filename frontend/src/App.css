@@ -730,6 +730,18 @@ header {
   font-size: 12.5px;
 }
 
+.hero-quick-btns {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.upload-label.disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
 /* ==================== BUTTONS & ALERTS ==================== */
 .primary-btn {
   display: inline-flex;
@@ -1518,5 +1530,33 @@ header {
   }
 }
 
-.hero-quick-btns { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.upload-label.disabled { opacity: 0.55; pointer-events: none; }
+/* ---- Admin: block / remove actions ---- */
+.row-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+.icon-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.block-pill,
+.ok-pill {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+.block-pill {
+  background: rgba(239, 68, 68, 0.16);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.45);
+}
+.ok-pill {
+  background: rgba(34, 197, 94, 0.14);
+  color: #86efac;
+  border: 1px solid rgba(34, 197, 94, 0.4);
+}

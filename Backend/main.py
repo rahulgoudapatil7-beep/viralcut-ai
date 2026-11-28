@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-29-durable-clips-big-captions"
+BUILD_TAG = "2026-11-29-admin-block-remove-gmail"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -845,6 +845,9 @@ def init_db() -> None:
 
         # Survive Render's disk wipes: keep the clip video itself in Postgres.
         _ensure_column(conn, "clips", "video_b64", "TEXT")
+        # Admin can block an account: login + existing tokens stop working.
+        _ensure_column(conn, "users", "blocked", "INTEGER DEFAULT 0")
+        _ensure_column(conn, "users", "blocked_at", "TEXT")
 
 
 init_db()
@@ -910,11 +913,21 @@ def get_current_user(authorization: str | None = Header(default=None)) -> dict[s
     payload = decode_token(token)
     with get_db() as conn:
         row = conn.execute(
-            "SELECT id, name, email, is_admin, created_at FROM users WHERE id = ?",
+            "SELECT id, name, email, is_admin, created_at, blocked FROM users WHERE id = ?",
             (payload["uid"],),
         ).fetchone()
     if not row:
         raise HTTPException(status_code=401, detail="User account not found.")
+    try:
+        if int(row["blocked"] or 0) == 1:
+            raise HTTPException(
+                status_code=403,
+                detail="This account has been blocked by the admin.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     return serialize_user(row)
 
 
@@ -2707,6 +2720,57 @@ def health(proxy: int = 0):
 
 
 # ---------- AUTH ROUTES ----------
+
+# ---------------- SIGN-UP EMAIL POLICY ----------------
+# Only real Gmail addresses. Anyone can type "@gmail.com", so a domain check is the
+# strongest gate that needs no email round-trip (set SMTP_APP_PASSWORD + the verify
+# flow for full proof of ownership).
+ALLOWED_EMAIL_DOMAINS = {
+    d.strip().lower()
+    for d in os.getenv("ALLOWED_EMAIL_DOMAINS", "gmail.com,googlemail.com").split(",")
+    if d.strip()
+}
+BLOCKED_EMAIL_DOMAINS = {
+    "example.com", "example.org", "test.com", "localhost", "mailinator.com",
+    "yopmail.com", "guerrillamail.com", "10minutemail.com", "tempmail.com",
+    "temp-mail.org", "trashmail.com", "sharklasers.com", "getnada.com",
+    "dispostable.com", "fakeinbox.com", "maildrop.cc", "mintemail.com",
+    "spam4.me", "grr.la", "throwawaymail.com", "mailnesia.com", "mohmal.com",
+    "emailondeck.com", "moakt.com", "tempr.email", "discard.email", "33mail.com",
+    "mailcatch.com", "inboxkitten.com", "mailsac.com", "tempail.com",
+}
+
+
+def validate_signup_email(email: str) -> str:
+    """Raise a friendly 400 unless this looks like a real Gmail address."""
+    email = (email or "").strip().lower()
+    if not re.match(r"^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$", email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    domain = email.rsplit("@", 1)[-1]
+    if domain in BLOCKED_EMAIL_DOMAINS:
+        raise HTTPException(
+            status_code=400,
+            detail="Temporary or disposable email addresses are not allowed. Please use your Gmail account.",
+        )
+    if domain not in ALLOWED_EMAIL_DOMAINS:
+        raise HTTPException(
+            status_code=400,
+            detail="Sign-up is Gmail only. Please register with a @gmail.com address.",
+        )
+    local = email.split("@")[0]
+    # Gmail's own rules: 6-30 chars, starts with a letter, letters/digits/dots only.
+    if (
+        not re.match(r"^[a-z][a-z0-9.]{5,29}$", local)
+        or ".." in local
+        or local.endswith(".")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="That Gmail address doesn't look valid. Gmail addresses are 6-30 characters and start with a letter.",
+        )
+    return email
+
+
 @app.post("/api/auth/register")
 def register(body: RegisterRequest):
     name = body.name.strip()
@@ -2715,8 +2779,7 @@ def register(body: RegisterRequest):
 
     if len(name) < 2:
         raise HTTPException(status_code=400, detail="Please enter your full name (at least 2 characters).")
-    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
-        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+    email = validate_signup_email(email)
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
 
@@ -2750,12 +2813,22 @@ def login(body: LoginRequest):
     email = body.email.strip().lower()
     with get_db() as conn:
         row = conn.execute(
-            "SELECT id, name, email, password_hash, is_admin, created_at FROM users WHERE email = ?",
+            "SELECT id, name, email, password_hash, is_admin, created_at, blocked FROM users WHERE email = ?",
             (email,),
         ).fetchone()
 
     if not row or not verify_password(body.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
+    try:
+        if int(row["blocked"] or 0) == 1:
+            raise HTTPException(
+                status_code=403,
+                detail="This account has been blocked by the admin. Contact rahulgoudapatil7@gmail.com.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
     user_obj = serialize_user(row)
     token = create_token(row["id"], row["email"], row["name"])
@@ -2899,6 +2972,75 @@ def reset_password(body: ResetPasswordRequest):
 
 
 # ---------- ADMIN ROUTE (SEE ALL REGISTERED USERS) ----------
+
+@app.post("/api/admin/users/{user_id}/block")
+def admin_block_user(user_id: int, body: dict[str, Any] | None = None,
+                     admin: dict[str, Any] = Depends(require_admin)):
+    """ADMIN ONLY: block (or unblock) an account. Blocked users cannot log in and lose live sessions."""
+    if int(user_id) == int(admin["id"]):
+        raise HTTPException(status_code=400, detail="You cannot block your own admin account.")
+    want_blocked = True if not body else bool(body.get("blocked", True))
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        row = conn.execute("SELECT id, email, is_admin FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="That account no longer exists.")
+        if int(row["is_admin"] or 0) == 1 and want_blocked:
+            raise HTTPException(status_code=400, detail="That account is an admin and cannot be blocked.")
+        conn.execute(
+            "UPDATE users SET blocked = ?, blocked_at = ? WHERE id = ?",
+            (1 if want_blocked else 0, now if want_blocked else None, user_id),
+        )
+    print(f"[ADMIN] {'blocked' if want_blocked else 'unblocked'} user {user_id} ({row['email']})")
+    return {"user_id": user_id, "email": row["email"], "blocked": want_blocked}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id: int, admin: dict[str, Any] = Depends(require_admin)):
+    """ADMIN ONLY: remove an account and everything it created."""
+    if int(user_id) == int(admin["id"]):
+        raise HTTPException(status_code=400, detail="You cannot remove your own admin account.")
+    with get_db() as conn:
+        target = conn.execute("SELECT id, name, email FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="That account no longer exists.")
+        files: list[str] = []
+        for row in conn.execute("SELECT filename FROM clips WHERE user_id = ?", (user_id,)).fetchall():
+            if row["filename"]:
+                files.append(row["filename"])
+        uploads: list[str] = []
+        for row in conn.execute("SELECT url, id FROM projects WHERE user_id = ?", (user_id,)).fetchall():
+            if str(row["url"] or "").startswith("upload://"):
+                uploads.append(str(row["url"]).replace("upload://", "", 1))
+            try:
+                conn.execute("DELETE FROM project_thumbs WHERE project_id = ?", (row["id"],))
+            except Exception:
+                pass
+        conn.execute("DELETE FROM clips WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM projects WHERE user_id = ?", (user_id,))
+        for table in ("password_resets",):
+            try:
+                conn.execute(f"DELETE FROM {table} WHERE email = ?", (target["email"],))
+            except Exception:
+                pass
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+    # Best-effort file cleanup (the DB rows are already gone).
+    for name in files:
+        try:
+            (CLIPS_DIR / Path(name).name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    for name in uploads:
+        try:
+            (UPLOADS_DIR / Path(name).name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    print(f"[ADMIN] removed user {user_id} ({target['email']}), {len(files)} clips, {len(uploads)} uploads")
+    return {"deleted": True, "user_id": user_id, "email": target["email"],
+            "clips_removed": len(files), "uploads_removed": len(uploads)}
+
+
 @app.get("/api/admin/users")
 def admin_list_users(_admin: dict[str, Any] = Depends(require_admin)):
     with get_db() as conn:
@@ -2909,6 +3051,7 @@ def admin_list_users(_admin: dict[str, Any] = Depends(require_admin)):
                 u.name,
                 u.email,
                 u.is_admin,
+                u.blocked,
                 u.created_at,
                 (SELECT COUNT(*) FROM projects p WHERE p.user_id = u.id) AS projects_count,
                 (SELECT COUNT(*) FROM clips c WHERE c.user_id = u.id) AS clips_count
@@ -2922,6 +3065,7 @@ def admin_list_users(_admin: dict[str, Any] = Depends(require_admin)):
         users.append(
             {
                 **serialize_user(r),
+                "blocked": bool(int(r["blocked"] or 0)),
                 "projects_count": r["projects_count"],
                 "clips_count": r["clips_count"],
             }

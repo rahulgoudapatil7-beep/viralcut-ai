@@ -25,6 +25,8 @@ import {
   Loader2,
   X,
   ShieldCheck,
+  Ban,
+  UserCheck,
   Copy,
   Check,
   Hash,
@@ -508,6 +510,42 @@ export default function App() {
       }
     } catch {
       setHealth({ status: "offline" });
+    }
+  }
+
+  async function toggleBlockUser(user) {
+    const action = user.blocked ? "Unblock" : "Block";
+    const ok = window.confirm(
+      user.blocked
+        ? `Unblock ${user.name} (${user.email})?\n\nThey will be able to log in again.`
+        : `Block ${user.name} (${user.email})?\n\nThey will be logged out immediately and cannot log in until you unblock them. Their projects and clips are kept.`
+    );
+    if (!ok) return;
+    try {
+      setAdminNotice("");
+      await apiFetch(`/admin/users/${user.id}/block`, {
+        method: "POST",
+        body: JSON.stringify({ blocked: !user.blocked }),
+      });
+      await loadAdminUsers();
+      setAdminNotice(`${action}ed ${user.email}.`);
+    } catch (err) {
+      setAdminNotice(err.message);
+    }
+  }
+
+  async function removeAdminUser(user) {
+    const ok = window.confirm(
+      `Remove ${user.name} (${user.email})?\n\nThis deletes their account, ${user.projects_count} project(s) and ${user.clips_count} clip(s). This cannot be undone.`
+    );
+    if (!ok) return;
+    try {
+      setAdminNotice("");
+      await apiFetch(`/admin/users/${user.id}`, { method: "DELETE" });
+      await loadAdminUsers();
+      setAdminNotice(`Removed ${user.email}.`);
+    } catch (err) {
+      setAdminNotice(err.message);
     }
   }
 
@@ -1805,8 +1843,10 @@ export default function App() {
                           <th>Name</th>
                           <th>Email</th>
                           <th>Joined</th>
+                          <th>Status</th>
                           <th>Projects</th>
                           <th>Clips Created</th>
+                          <th></th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1838,8 +1878,35 @@ export default function App() {
                                   minute: "2-digit",
                                 })}
                               </td>
+                              <td>
+                                {u.blocked ? (
+                                  <span className="block-pill">BLOCKED</span>
+                                ) : (
+                                  <span className="ok-pill">ACTIVE</span>
+                                )}
+                              </td>
                               <td>{u.projects_count}</td>
                               <td>{u.clips_count}</td>
+                              <td className="row-actions">
+                                <button
+                                  type="button"
+                                  className="icon-btn"
+                                  title={u.blocked ? "Unblock this account" : "Block this account"}
+                                  onClick={() => toggleBlockUser(u)}
+                                  disabled={u.is_admin}
+                                >
+                                  {u.blocked ? <UserCheck size={15} /> : <Ban size={15} />}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="icon-btn danger"
+                                  title="Remove this account permanently"
+                                  onClick={() => removeAdminUser(u)}
+                                  disabled={u.is_admin}
+                                >
+                                  <Trash2 size={15} />
+                                </button>
+                              </td>
                             </tr>
                           ))}
                       </tbody>
