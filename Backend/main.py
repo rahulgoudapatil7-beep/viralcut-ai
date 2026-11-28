@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-29-gmail-otp-verify"
+BUILD_TAG = "2026-11-29-block-fix"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -3208,12 +3208,25 @@ def reset_password(body: ResetPasswordRequest):
 # ---------- ADMIN ROUTE (SEE ALL REGISTERED USERS) ----------
 
 @app.post("/api/admin/users/{user_id}/block")
-def admin_block_user(user_id: int, body: dict[str, Any] | None = None,
-                     admin: dict[str, Any] = Depends(require_admin)):
+async def admin_block_user(user_id: int, request: Request,
+                           admin: dict[str, Any] = Depends(require_admin)):
     """ADMIN ONLY: block (or unblock) an account. Blocked users cannot log in and lose live sessions."""
     if int(user_id) == int(admin["id"]):
         raise HTTPException(status_code=400, detail="You cannot block your own admin account.")
-    want_blocked = True if not body else bool(body.get("blocked", True))
+    # Accept a JSON body, a form body, or no body at all (defaults to block).
+    want_blocked = True
+    try:
+        raw = await request.body()
+        if raw:
+            text = raw.decode("utf-8", "ignore").strip()
+            if text.startswith("{"):
+                payload = json.loads(text)
+                if isinstance(payload, dict):
+                    want_blocked = bool(payload.get("blocked", True))
+            elif "blocked=" in text:
+                want_blocked = "blocked=false" not in text.replace(" ", "").lower()
+    except Exception:
+        want_blocked = True
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
         row = conn.execute("SELECT id, email, is_admin FROM users WHERE id = ?", (user_id,)).fetchone()

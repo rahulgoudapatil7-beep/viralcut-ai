@@ -558,18 +558,28 @@ export default function App() {
 
   async function apiFetch(path, options = {}, overrideToken = null) {
     const activeToken = overrideToken ?? token;
+    const isJsonBody = typeof options.body === "string";
     const headers = {
+      ...(isJsonBody ? { "Content-Type": "application/json" } : {}),
       ...(options.headers || {}),
       ...(activeToken ? { Authorization: `Bearer ${activeToken}` } : {}),
     };
     const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
     const data = await res.json().catch(() => ({}));
+    const message =
+      typeof data.detail === "string"
+        ? data.detail
+        : Array.isArray(data.detail)
+        ? data.detail.map((d) => d.msg || d.message || "Invalid input").join(" · ")
+        : data.detail && typeof data.detail === "object"
+        ? data.detail.message || "Request failed."
+        : "";
     if (res.status === 401) {
       handleLogout();
-      throw new Error(data.detail || "Session expired. Please log in again.");
+      throw new Error(message || "Session expired. Please log in again.");
     }
     if (!res.ok) {
-      throw new Error(data.detail || "Request failed.");
+      throw new Error(message || `Request failed (HTTP ${res.status}).`);
     }
     return data;
   }
