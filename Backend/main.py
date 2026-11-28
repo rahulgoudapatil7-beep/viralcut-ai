@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-28-groq-asr-tdh"
+BUILD_TAG = "2026-11-28-word-sync-captions"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -1821,7 +1821,7 @@ def build_synced_ass(
     clip_dur = max(1.0, clip_end - clip_start)
     theme = CAPTION_THEMES.get(theme_key, CAPTION_THEMES["gold"])
 
-    raw_items: list[tuple[float, float, str]] = []
+    raw_items: list[tuple[float, float, str, list]] = []
     full_sample = []
     for seg in transcript:
         seg_start = _safe_float(seg["start"])
@@ -1835,7 +1835,17 @@ def build_synced_ass(
         text = re.sub(r"\s+", " ", str(seg["text"])).strip()
         if not text:
             continue
-        raw_items.append((rel_start, rel_end, text))
+        word_times: list[tuple[str, float, float]] = []
+        for w in seg.get("words") or []:
+            try:
+                w_text = str(w.get("w", "")).strip()
+                w_start = _safe_float(w.get("s"), seg_start)
+                w_end = _safe_float(w.get("e"), w_start + 0.25)
+            except Exception:
+                continue
+            if w_text and w_end > clip_start and w_start < clip_end:
+                word_times.append((w_text, w_start, w_end))
+        raw_items.append((rel_start, rel_end, text, word_times))
         full_sample.append(text)
 
     if not raw_items:
@@ -1865,7 +1875,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     cues: list[list[Any]] = []
     max_words_per_chunk = 5
 
-    for rel_start, rel_end, text in raw_items:
+    for rel_start, rel_end, text, word_times in raw_items:
+        # Preferred: exact per-word timings from the ASR (captions land on the beat).
+        if len(word_times) >= 2:
+            for i in range(0, len(word_times), max_words_per_chunk):
+                group = word_times[i : i + max_words_per_chunk]
+                if not group:
+                    continue
+                ch_start = max(0.0, group[0][1] - clip_start)
+                ch_end = min(clip_dur, group[-1][2] - clip_start)
+                if ch_end - ch_start < 0.2:
+                    continue
+                styled = style_premium_line([g[0] for g in group], theme["accent"])
+                cues.append([ch_start, ch_end, styled])
+            continue
+
         words = text.split()
         if len(words) <= max_words_per_chunk:
             chunks = [words]
@@ -3130,7 +3154,7 @@ def _detect_speech_language(audio) -> tuple[str, float]:
 # 512 MB container. Groq's free tier runs whisper-large-v3-turbo (8 h/day free), so
 # when GROQ_API_KEY is set we transcribe there; otherwise we fall back to local.
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-GROQ_ASR_MODEL = os.getenv("GROQ_ASR_MODEL", "whisper-large-v3-turbo")
+GROQ_ASR_MODEL = os.getenv("GROQ_ASR_MODEL", "whisper-large-v3")
 GROQ_ASR_MAX_SEC = float(os.getenv("GROQ_ASR_MAX_SEC", "600"))  # 25 MB cap -> ~13 min at 16 kHz
 
 
@@ -3165,17 +3189,34 @@ def _groq_transcribe_pcm(raw: bytes, lang: str = "") -> list[dict[str, Any]] | N
         if len(piece) < 32000:  # under 1 s — nothing useful
             continue
         offset = offset_bytes / 32000.0
-        data = {"model": GROQ_ASR_MODEL, "response_format": "verbose_json", "temperature": "0"}
+        data = {
+            "model": GROQ_ASR_MODEL,
+            "response_format": "verbose_json",
+            "temperature": "0",
+            # real word timings -> captions land exactly when the words are spoken
+            "timestamp_granularities[]": ["word", "segment"],
+        }
         if lang:
             data["language"] = lang
+        wav = _pcm_to_wav(piece)
         try:
             r = httpx.post(
                 f"{GROQ_BASE_URL}/audio/transcriptions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 data=data,
-                files={"file": ("audio.wav", _pcm_to_wav(piece), "audio/wav")},
+                files={"file": ("audio.wav", wav, "audio/wav")},
                 timeout=240,
             )
+            if r.status_code == 400 and "timestamp_granularities[]" in data:
+                # Model/plan may not support word timings — retry without them.
+                data.pop("timestamp_granularities[]", None)
+                r = httpx.post(
+                    f"{GROQ_BASE_URL}/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    data=data,
+                    files={"file": ("audio.wav", wav, "audio/wav")},
+                    timeout=240,
+                )
             r.raise_for_status()
             payload = r.json()
         except Exception as exc:
@@ -3183,6 +3224,16 @@ def _groq_transcribe_pcm(raw: bytes, lang: str = "") -> list[dict[str, Any]] | N
             return None
         detected = payload.get("language") or detected
         segs = payload.get("segments") or []
+        all_words: list[dict[str, Any]] = []
+        for w in payload.get("words") or []:
+            try:
+                w_text = str(w.get("word") or w.get("text") or "").strip()
+                w_start = float(w.get("start", 0.0))
+                w_end = float(w.get("end", w_start + 0.2))
+            except Exception:
+                continue
+            if w_text:
+                all_words.append({"w": w_text, "s": offset + w_start, "e": offset + w_end})
         for s in segs:
             text = str(s.get("text", "")).strip()
             if not text:
@@ -3192,11 +3243,17 @@ def _groq_transcribe_pcm(raw: bytes, lang: str = "") -> list[dict[str, Any]] | N
                 s_end = float(s.get("end", s_start + 1.0))
             except Exception:
                 continue
+            seg_words = [
+                {"w": w["w"], "s": round(w["s"], 3), "e": round(w["e"], 3)}
+                for w in all_words
+                if (s_start - 0.2 + offset) <= ((w["s"] + w["e"]) / 2.0) <= (s_end + 0.2 + offset)
+            ]
             out.append(
                 {
                     "start": round(offset + s_start, 2),
                     "duration": round(max(0.4, s_end - s_start), 2),
                     "text": text,
+                    **({"words": seg_words} if seg_words else {}),
                 }
             )
         if not segs and payload.get("text"):
@@ -3221,9 +3278,10 @@ def transcribe_video_section(video_path: Path, start: float, end: float) -> list
     if not FFMPEG_BIN or not video_path.exists():
         return []
 
-    pad = 0.4
-    base = max(0.0, float(start) - pad)
-    dur = max(1.0, float(end) - float(start) + pad * 2)
+    lead_in = float(os.getenv("ASR_LEAD_IN_SEC", "2.5"))
+    lead_out = float(os.getenv("ASR_LEAD_OUT_SEC", "1.0"))
+    base = max(0.0, float(start) - lead_in)
+    dur = max(1.0, (float(end) + lead_out) - base)
     try:
         raw = subprocess.run(
             [
