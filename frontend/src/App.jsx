@@ -90,6 +90,9 @@ function AuthScreen({ onAuthSuccess }) {
   // Forgot password state
   const [resetStep, setResetStep] = useState(1); // 1 = request code, 2 = enter code + new password
   const [resetCode, setResetCode] = useState("");
+  // Gmail OTP verification state
+  const [otp, setOtp] = useState("");
+  const [resendBusy, setResendBusy] = useState(false);
   const [newPassword, setNewPassword] = useState("");
 
   const [loading, setLoading] = useState(false);
@@ -98,6 +101,7 @@ function AuthScreen({ onAuthSuccess }) {
 
   function switchMode(next) {
     setMode(next);
+    setOtp("");
     setError("");
     setInfo("");
     setShowPassword(false);
@@ -133,12 +137,43 @@ function AuthScreen({ onAuthSuccess }) {
     return data;
   }
 
+  async function resendCode() {
+    setResendBusy(true);
+    setError("");
+    setInfo("");
+    try {
+      const res = await fetch(`${API_BASE}/auth/resend-code`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const data = await parseResponse(res);
+      setInfo(data.message || "A new code is on its way.");
+    } catch (err) {
+      setError(err.message || "Could not resend the code.");
+    } finally {
+      setResendBusy(false);
+    }
+  }
+
   async function handleSubmit(e) {
     e.preventDefault();
     setError("");
     setInfo("");
     setLoading(true);
     try {
+      if (mode === "verify") {
+        const res = await fetch(`${API_BASE}/auth/verify-email`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, code: otp }),
+        });
+        const data = await parseResponse(res);
+        localStorage.setItem("viralcut_token", data.token);
+        onAuthSuccess(data.user, data.token);
+        return;
+      }
+
       if (mode === "forgot") {
         if (resetStep === 1) {
           const res = await fetch(`${API_BASE}/auth/forgot-password`, {
@@ -178,6 +213,15 @@ function AuthScreen({ onAuthSuccess }) {
         body: JSON.stringify(payload),
       });
       const data = await parseResponse(res);
+      if (data.needs_verification) {
+        setMode("verify");
+        setOtp("");
+        setInfo(
+          data.message ||
+            `We emailed a 6-digit code to ${data.email || email}. Enter it below to activate your account.`
+        );
+        return;
+      }
       localStorage.setItem("viralcut_token", data.token);
       onAuthSuccess(data.user, data.token);
     } catch (err) {
@@ -203,7 +247,22 @@ function AuthScreen({ onAuthSuccess }) {
           </div>
         </div>
 
-        {mode !== "forgot" ? (
+        {mode === "verify" ? (
+          <div className="forgot-header">
+            <button
+              type="button"
+              className="link-btn back-link"
+              onClick={() => switchMode("login")}
+            >
+              <ArrowLeft size={14} /> Back to Log In
+            </button>
+            <h3>Verify Your Gmail</h3>
+            <p>
+              We sent a 6-digit code to <strong>{email}</strong>. Enter it below — your account
+              activates only after the code matches, so throwaway addresses can never sign up.
+            </p>
+          </div>
+        ) : mode !== "forgot" ? (
           <div className="auth-tabs">
             <button
               type="button"
@@ -265,12 +324,12 @@ function AuthScreen({ onAuthSuccess }) {
                 placeholder="you@example.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                disabled={mode === "forgot" && resetStep === 2}
+                disabled={(mode === "forgot" && resetStep === 2) || mode === "verify"}
               />
             </div>
           </label>
 
-          {mode !== "forgot" && (
+          {mode !== "forgot" && mode !== "verify" && (
             <label className="field">
               <div className="field-label-row">
                 <span>Password</span>
@@ -350,6 +409,30 @@ function AuthScreen({ onAuthSuccess }) {
             </>
           )}
 
+          {mode === "verify" && (
+            <>
+              <label className="field">
+                <span>6-Digit Code from Gmail</span>
+                <div className="field-input">
+                  <KeyRound size={16} />
+                  <input
+                    type="text"
+                    required
+                    inputMode="numeric"
+                    maxLength={6}
+                    placeholder="Enter the 6-digit code"
+                    value={otp}
+                    onChange={(e) => setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                    autoFocus
+                  />
+                </div>
+              </label>
+              <button type="button" className="link-btn small-link" onClick={resendCode} disabled={resendBusy}>
+                {resendBusy ? "Sending new code…" : "Didn't get it? Resend code"}
+              </button>
+            </>
+          )}
+
           {info && (
             <div className="alert success">
               <CheckCircle2 size={16} />
@@ -368,7 +451,9 @@ function AuthScreen({ onAuthSuccess }) {
             {loading ? (
               <>
                 <Loader2 size={17} className="spin" />
-                {mode === "register"
+                {mode === "verify"
+                  ? "Verifying..."
+                  : mode === "register"
                   ? "Creating account..."
                   : mode === "forgot"
                   ? resetStep === 1
@@ -378,8 +463,10 @@ function AuthScreen({ onAuthSuccess }) {
               </>
             ) : (
               <>
-                {mode === "forgot" ? <KeyRound size={17} /> : <Sparkles size={17} />}
-                {mode === "register"
+                {mode === "forgot" || mode === "verify" ? <KeyRound size={17} /> : <Sparkles size={17} />}
+                {mode === "verify"
+                  ? "Verify & Enter Workspace"
+                  : mode === "register"
                   ? "Create Free Account"
                   : mode === "forgot"
                   ? resetStep === 1
@@ -391,7 +478,7 @@ function AuthScreen({ onAuthSuccess }) {
           </button>
         </form>
 
-        {mode !== "forgot" && (
+        {mode !== "forgot" && mode !== "verify" && (
           <div className="auth-footer">
             {mode === "login" ? (
               <p>
@@ -471,18 +558,28 @@ export default function App() {
 
   async function apiFetch(path, options = {}, overrideToken = null) {
     const activeToken = overrideToken ?? token;
+    const isJsonBody = typeof options.body === "string";
     const headers = {
+      ...(isJsonBody ? { "Content-Type": "application/json" } : {}),
       ...(options.headers || {}),
       ...(activeToken ? { Authorization: `Bearer ${activeToken}` } : {}),
     };
     const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
     const data = await res.json().catch(() => ({}));
+    const message =
+      typeof data.detail === "string"
+        ? data.detail
+        : Array.isArray(data.detail)
+        ? data.detail.map((d) => d.msg || d.message || "Invalid input").join(" · ")
+        : data.detail && typeof data.detail === "object"
+        ? data.detail.message || "Request failed."
+        : "";
     if (res.status === 401) {
       handleLogout();
-      throw new Error(data.detail || "Session expired. Please log in again.");
+      throw new Error(message || "Session expired. Please log in again.");
     }
     if (!res.ok) {
-      throw new Error(data.detail || "Request failed.");
+      throw new Error(message || `Request failed (HTTP ${res.status}).`);
     }
     return data;
   }

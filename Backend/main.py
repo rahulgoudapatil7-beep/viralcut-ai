@@ -18,7 +18,7 @@ import time
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-29-admin-block-remove-gmail"
+BUILD_TAG = "2026-11-29-block-fix"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -742,15 +742,17 @@ def _table_columns(conn, table: str) -> set[str]:
         return set()
 
 
-def _ensure_column(conn, table: str, column: str, decl: str) -> None:
-    """Add a column to an existing table (Neon tables predate newer fields)."""
+def _ensure_column(conn, table: str, column: str, decl: str) -> bool:
+    """Add a column to an existing table. Returns True when it had to be created."""
     if column in _table_columns(conn, table):
-        return
+        return False
     try:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         print(f"[DB] migrated: {table}.{column} added")
+        return True
     except Exception as exc:
         print(f"[DB] migrate {table}.{column} failed: {exc}")
+        return False
 
 
 def init_db() -> None:
@@ -848,6 +850,16 @@ def init_db() -> None:
         # Admin can block an account: login + existing tokens stop working.
         _ensure_column(conn, "users", "blocked", "INTEGER DEFAULT 0")
         _ensure_column(conn, "users", "blocked_at", "TEXT")
+        # Gmail OTP verification: a new sign-up stays locked until the code is entered.
+        added_verified = _ensure_column(conn, "users", "verified", "INTEGER")
+        _ensure_column(conn, "users", "verify_code", "TEXT")
+        _ensure_column(conn, "users", "verify_expires", "TEXT")
+        _ensure_column(conn, "users", "verify_attempts", "INTEGER DEFAULT 0")
+        _ensure_column(conn, "users", "verify_sent_at", "TEXT")
+        if added_verified:
+            # Everybody who registered before this feature keeps working.
+            conn.execute("UPDATE users SET verified = 1")
+            print("[DB] users.verified added - existing accounts grandfathered as verified")
 
 
 init_db()
@@ -2712,6 +2724,7 @@ def health(proxy: int = 0):
         "low_cpu_mode": LOW_CPU,
         "max_upload_mb": MAX_UPLOAD_MB,
         "disk_free_mb": round(_free_mb(), 1),
+        "email_verification": "on (gmail otp)" if smtp_ready() else "off - set SMTP_APP_PASSWORD on Render",
         "build": BUILD_TAG,
     }
     if proxy:
@@ -2771,6 +2784,190 @@ def validate_signup_email(email: str) -> str:
     return email
 
 
+
+# ---------------- GMAIL OTP VERIFICATION ----------------
+VERIFY_CODE_TTL_MIN = int(os.getenv("VERIFY_CODE_TTL_MIN", "10"))
+VERIFY_MAX_ATTEMPTS = int(os.getenv("VERIFY_MAX_ATTEMPTS", "5"))
+VERIFY_RESEND_SECONDS = int(os.getenv("VERIFY_RESEND_SECONDS", "60"))
+
+
+def smtp_ready() -> bool:
+    """True when a Gmail app password is configured (needed to actually email an OTP)."""
+    return bool(SMTP_EMAIL.strip() and SMTP_APP_PASSWORD.replace(" ", "").strip())
+
+
+def _gen_otp() -> str:
+    return f"{secrets.randbelow(900000) + 100000}"
+
+
+def send_verify_email(to_email: str, user_name: str, code: str) -> None:
+    """Email the 6-digit sign-up verification code via Gmail SMTP (SSL 465)."""
+    app_pw = SMTP_APP_PASSWORD.replace(" ", "").strip()
+    sender = SMTP_EMAIL.strip()
+    if not sender or not app_pw:
+        raise RuntimeError(
+            "Gmail SMTP is not configured. Add a 16-character Google App Password "
+            "to the SMTP_APP_PASSWORD env var on Render."
+        )
+    msg = EmailMessage()
+    msg["Subject"] = f"{code} is your ViralCut AI verification code"
+    msg["From"] = f"ViralCut AI <{sender}>"
+    msg["To"] = to_email
+    msg.set_content(
+        f"Hi {user_name},\n\n"
+        f"Your ViralCut AI verification code is: {code}\n\n"
+        f"Enter it on the sign-up screen to activate your account. "
+        f"The code expires in {VERIFY_CODE_TTL_MIN} minutes.\n\n"
+        f"If you did not sign up, ignore this email - no account will be activated.\n\n"
+        f"- ViralCut AI"
+    )
+    msg.add_alternative(
+        f"""
+        <div style="font-family:Inter,Arial,sans-serif;background:#090912;color:#f5f3ff;padding:32px;border-radius:14px;max-width:480px;margin:auto;">
+          <h2 style="margin:0 0 8px;color:#ffffff;">ViralCut <span style="color:#a66aff;">AI</span></h2>
+          <p style="color:#b8b5cf;font-size:14px;">Hi {user_name},</p>
+          <p style="color:#d6d3eb;font-size:14px;line-height:1.6;">
+            Confirm this is your Gmail address to activate your ViralCut AI account.
+            The code expires in <strong>{VERIFY_CODE_TTL_MIN} minutes</strong>.
+          </p>
+          <div style="margin:22px 0;padding:16px;text-align:center;background:#17152a;border:1px solid #4c2f8a;border-radius:12px;font-size:32px;font-weight:800;letter-spacing:8px;color:#ffd726;">
+            {code}
+          </div>
+          <p style="color:#8f8ca8;font-size:12px;">If you didn't sign up for ViralCut AI, you can safely ignore this email.</p>
+        </div>
+        """,
+        subtype="html",
+    )
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
+        smtp.login(sender, app_pw)
+        smtp.send_message(msg)
+
+
+def _issue_verify_code(uid: int, email: str, name: str) -> str:
+    """Create + store a fresh OTP and email it. Raises HTTPException if the mail fails."""
+    code = _gen_otp()
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=VERIFY_CODE_TTL_MIN)).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE users SET verify_code = ?, verify_expires = ?, verify_attempts = 0, verify_sent_at = ? WHERE id = ?",
+            (code, expires, datetime.now(timezone.utc).isoformat(), uid),
+        )
+    try:
+        send_verify_email(email, name, code)
+    except Exception as exc:
+        print(f"[OTP] send failed for {email}: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="We could not send the verification email right now. Please try 'Resend code' in a minute.",
+        )
+    print(f"[OTP] verification code sent to {email}")
+    return code
+
+
+class VerifyEmailRequest(BaseModel):
+    email: str
+    code: str
+
+
+class EmailOnlyRequest(BaseModel):
+    email: str
+
+
+@app.post("/api/auth/verify-email")
+def verify_email(body: VerifyEmailRequest):
+    email = body.email.strip().lower()
+    code = re.sub(r"\D", "", str(body.code or ""))[:6]
+    if len(code) != 6:
+        raise HTTPException(status_code=400, detail="Enter the full 6-digit code from your Gmail.")
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, name, email, is_admin, created_at, verified, verify_code, verify_expires, verify_attempts "
+            "FROM users WHERE email = ?",
+            (email,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="No account found for that email. Please sign up again.")
+
+        uid = row["id"]
+        if int(row["verified"] or 0) == 1:
+            token = create_token(uid, row["email"], row["name"])
+            return {"token": token, "user": serialize_user(row), "message": "Email already verified."}
+
+        attempts = int(row["verify_attempts"] or 0)
+        if attempts >= VERIFY_MAX_ATTEMPTS:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many wrong codes. Tap 'Resend code' to get a fresh one.",
+            )
+
+        expired = True
+        try:
+            exp = datetime.fromisoformat(str(row["verify_expires"]))
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            expired = datetime.now(timezone.utc) > exp
+        except Exception:
+            expired = True
+        if expired or not row["verify_code"]:
+            raise HTTPException(
+                status_code=400,
+                detail="That code has expired. Tap 'Resend code' to get a new one.",
+            )
+
+        if code != str(row["verify_code"]):
+            left = VERIFY_MAX_ATTEMPTS - attempts - 1
+            conn.execute("UPDATE users SET verify_attempts = ? WHERE id = ?", (attempts + 1, uid))
+            raise HTTPException(
+                status_code=400,
+                detail=f"Incorrect code. {left} attempt(s) left before you must resend."
+                if left > 0
+                else "Incorrect code. Tap 'Resend code' to get a new one.",
+            )
+
+        conn.execute(
+            "UPDATE users SET verified = 1, verify_code = NULL, verify_expires = NULL, "
+            "verify_attempts = 0, verify_sent_at = NULL WHERE id = ?",
+            (uid,),
+        )
+        row = conn.execute(
+            "SELECT id, name, email, is_admin, created_at FROM users WHERE id = ?", (uid,)
+        ).fetchone()
+
+    print(f"[OTP] {email} verified")
+    token = create_token(uid, row["email"], row["name"])
+    return {"token": token, "user": serialize_user(row), "message": "Gmail verified. Welcome aboard!"}
+
+
+@app.post("/api/auth/resend-code")
+def resend_verify_code(body: EmailOnlyRequest):
+    email = body.email.strip().lower()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, name, verified, verify_sent_at FROM users WHERE email = ?", (email,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="No account found for that email.")
+    if int(row["verified"] or 0) == 1:
+        raise HTTPException(status_code=400, detail="This email is already verified - please just log in.")
+    try:
+        last = datetime.fromisoformat(str(row["verify_sent_at"]))
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        waited = (datetime.now(timezone.utc) - last).total_seconds()
+        if waited < VERIFY_RESEND_SECONDS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {int(VERIFY_RESEND_SECONDS - waited)}s before requesting another code.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    _issue_verify_code(row["id"], email, row["name"])
+    return {"message": f"A new 6-digit code is on its way to {email}."}
+
+
 @app.post("/api/auth/register")
 def register(body: RegisterRequest):
     name = body.name.strip()
@@ -2789,9 +2986,10 @@ def register(body: RegisterRequest):
         with get_db() as conn:
             existing_count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
             is_admin = 1 if (existing_count == 0 or email in {e.lower() for e in ADMIN_EMAILS}) else 0
+            needs_otp = smtp_ready() and is_admin == 0
             cur = conn.execute(
-                "INSERT INTO users (name, email, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
-                (name, email, pw_hash, is_admin, now),
+                "INSERT INTO users (name, email, password_hash, is_admin, created_at, verified) VALUES (?, ?, ?, ?, ?, ?)",
+                (name, email, pw_hash, is_admin, now, 0 if needs_otp else 1),
             )
             uid = cur.lastrowid
             row = conn.execute(
@@ -2804,6 +3002,18 @@ def register(body: RegisterRequest):
         raise HTTPException(status_code=409, detail="An account with this email already exists. Please log in.")
 
     user_obj = serialize_user(row)
+
+    if needs_otp:
+        _issue_verify_code(uid, email, name)
+        return {
+            "needs_verification": True,
+            "email": email,
+            "user": user_obj,
+            "message": f"We emailed a 6-digit code to {email}. Enter it to activate your account.",
+        }
+
+    if not smtp_ready():
+        print("[OTP] SMTP not configured - account activated without email verification")
     token = create_token(uid, email, name)
     return {"token": token, "user": user_obj}
 
@@ -2813,12 +3023,36 @@ def login(body: LoginRequest):
     email = body.email.strip().lower()
     with get_db() as conn:
         row = conn.execute(
-            "SELECT id, name, email, password_hash, is_admin, created_at, blocked FROM users WHERE email = ?",
+            "SELECT id, name, email, password_hash, is_admin, created_at, blocked, verified FROM users WHERE email = ?",
             (email,),
         ).fetchone()
 
     if not row or not verify_password(body.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
+    if int(row["verified"] or 0) == 0 and smtp_ready():
+        recent = False
+        try:
+            with get_db() as conn2:
+                v = conn2.execute(
+                    "SELECT verify_code, verify_sent_at FROM users WHERE id = ?", (row["id"],)
+                ).fetchone()
+            if v and v["verify_code"]:
+                last = datetime.fromisoformat(str(v["verify_sent_at"]))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                recent = (datetime.now(timezone.utc) - last).total_seconds() < VERIFY_RESEND_SECONDS
+        except Exception:
+            recent = False
+        if not recent:
+            try:
+                _issue_verify_code(row["id"], row["email"], row["name"])
+            except Exception:
+                pass
+        return {
+            "needs_verification": True,
+            "email": row["email"],
+            "message": f"Verify your Gmail first - we just sent a fresh 6-digit code to {row['email']}.",
+        }
     try:
         if int(row["blocked"] or 0) == 1:
             raise HTTPException(
@@ -2974,12 +3208,25 @@ def reset_password(body: ResetPasswordRequest):
 # ---------- ADMIN ROUTE (SEE ALL REGISTERED USERS) ----------
 
 @app.post("/api/admin/users/{user_id}/block")
-def admin_block_user(user_id: int, body: dict[str, Any] | None = None,
-                     admin: dict[str, Any] = Depends(require_admin)):
+async def admin_block_user(user_id: int, request: Request,
+                           admin: dict[str, Any] = Depends(require_admin)):
     """ADMIN ONLY: block (or unblock) an account. Blocked users cannot log in and lose live sessions."""
     if int(user_id) == int(admin["id"]):
         raise HTTPException(status_code=400, detail="You cannot block your own admin account.")
-    want_blocked = True if not body else bool(body.get("blocked", True))
+    # Accept a JSON body, a form body, or no body at all (defaults to block).
+    want_blocked = True
+    try:
+        raw = await request.body()
+        if raw:
+            text = raw.decode("utf-8", "ignore").strip()
+            if text.startswith("{"):
+                payload = json.loads(text)
+                if isinstance(payload, dict):
+                    want_blocked = bool(payload.get("blocked", True))
+            elif "blocked=" in text:
+                want_blocked = "blocked=false" not in text.replace(" ", "").lower()
+    except Exception:
+        want_blocked = True
     now = datetime.now(timezone.utc).isoformat()
     with get_db() as conn:
         row = conn.execute("SELECT id, email, is_admin FROM users WHERE id = ?", (user_id,)).fetchone()
