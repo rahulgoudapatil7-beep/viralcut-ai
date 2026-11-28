@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-29-sync-selfheal"
+BUILD_TAG = "2026-11-29-durable-clips-big-captions"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -728,6 +728,31 @@ def get_db():
         conn.close()
 
 
+def _table_columns(conn, table: str) -> set[str]:
+    try:
+        if DATABASE_URL and psycopg is not None:
+            rows = conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = ?", (table,)
+            ).fetchall()
+            return {r["column_name"] for r in rows}
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {r["name"] for r in rows}
+    except Exception as exc:
+        print(f"[DB] could not read columns for {table}: {exc}")
+        return set()
+
+
+def _ensure_column(conn, table: str, column: str, decl: str) -> None:
+    """Add a column to an existing table (Neon tables predate newer fields)."""
+    if column in _table_columns(conn, table):
+        return
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        print(f"[DB] migrated: {table}.{column} added")
+    except Exception as exc:
+        print(f"[DB] migrate {table}.{column} failed: {exc}")
+
+
 def init_db() -> None:
     with get_db() as conn:
         conn.execute(
@@ -817,6 +842,9 @@ def init_db() -> None:
             conn.execute("ALTER TABLE projects ADD COLUMN clip_length INTEGER DEFAULT 30")
         if "max_clips" not in proj_cols:
             conn.execute("ALTER TABLE projects ADD COLUMN max_clips INTEGER DEFAULT 5")
+
+        # Survive Render's disk wipes: keep the clip video itself in Postgres.
+        _ensure_column(conn, "clips", "video_b64", "TEXT")
 
 
 init_db()
@@ -1288,7 +1316,6 @@ def extract_topic_hashtags(video_title: str, lang: str = "en") -> list[str]:
             seen.add(d.lower())
             tags.append(d)
     return tags[:8]
-
 
 
 # ---------------- VIRAL TITLE / DESCRIPTION / HASHTAGS ENGINE ----------------
@@ -1895,7 +1922,9 @@ def build_synced_ass(
 
     use_indic = has_indic_chars(" ".join(full_sample))
     font_file, font_name = FONTS["indic"] if use_indic else FONTS["latin"]
-    font_size = 34 if not use_indic else 36  # Compact, sleek creator sizing on 1920x1080 canvas
+    # Bigger, clearly readable captions (env-tunable without code changes).
+    default_size = int(os.getenv("CAPTION_FONT_SIZE", "52"))
+    font_size = default_size if not use_indic else default_size + 2
 
     # IMPORTANT: Spacing MUST be 0! Non-zero letter spacing breaks Hindi/Devanagari
     # matra shaping in libass and causes dotted circles (◌) between letters.
@@ -1908,7 +1937,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Premium,{font_name},{font_size},{theme['primary']},{theme['accent']},{theme['outline']},{theme['shadow']},-1,0,0,0,100,100,0,0,1,2.0,1.4,2,90,90,54,1
+Style: Premium,{font_name},{font_size},{theme['primary']},{theme['accent']},{theme['outline']},{theme['shadow']},-1,0,0,0,100,100,0,0,1,{os.getenv("CAPTION_OUTLINE", "3.4")},{os.getenv("CAPTION_SHADOW", "2.0")},2,70,70,70,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -2924,7 +2953,8 @@ def get_workspace(user: dict[str, Any] = Depends(get_current_user)):
 
         clip_rows = conn.execute(
             """
-            SELECT id, project_id, video_id, title, description, hashtags_json, start_time, end_time, score, filename, has_captions, quality, created_at
+            SELECT id, project_id, video_id, title, description, hashtags_json, start_time, end_time, score, filename, has_captions, quality, created_at,
+                   CASE WHEN video_b64 IS NULL THEN 0 ELSE 1 END AS has_db_copy
             FROM clips
             WHERE user_id = ?
             ORDER BY id DESC
@@ -2951,12 +2981,16 @@ def get_workspace(user: dict[str, Any] = Depends(get_current_user)):
             }
         )
 
-    # ONLY return clips that YOU actually cut AND whose file exists on disk!
+    # Return every clip the user cut. A missing file (Render restart) is flagged
+    # rather than hidden — the history and metadata must survive.
     clips = []
     for c in clip_rows:
         file_path = CLIPS_DIR / c["filename"]
-        if not file_path.exists():
-            continue
+        try:
+            db_copy = bool(c["has_db_copy"])
+        except Exception:
+            db_copy = False
+        has_file = file_path.exists() or db_copy
         try:
             tags = json.loads(c["hashtags_json"] or "[]")
         except Exception:
@@ -2979,6 +3013,7 @@ def get_workspace(user: dict[str, Any] = Depends(get_current_user)):
                 "video_url": f"/api/clips/file/{c['filename']}",
                 "download_url": f"/api/clips/file/{c['filename']}?download=1",
                 "created_at": c["created_at"],
+                "available": has_file,
             }
         )
 
@@ -4227,6 +4262,27 @@ def _perform_cut(
         )
         clip_id = cur.lastrowid
 
+    # Keep the MP4 in Postgres too (files vanish on every Render restart).
+    try:
+        cap_mb = float(os.getenv("CLIP_DB_MAX_MB", "12"))
+        if out_path.exists() and out_path.stat().st_size <= cap_mb * 1024 * 1024:
+            import base64 as _b64
+
+            payload = _b64.b64encode(out_path.read_bytes()).decode("ascii")
+            with get_db() as conn:
+                conn.execute("UPDATE clips SET video_b64 = ? WHERE id = ?", (payload, clip_id))
+                keep = int(os.getenv("CLIP_DB_KEEP", "20"))
+                conn.execute(
+                    "UPDATE clips SET video_b64 = NULL WHERE video_b64 IS NOT NULL AND id NOT IN "
+                    "(SELECT id FROM clips WHERE video_b64 IS NOT NULL ORDER BY id DESC LIMIT ?)",
+                    (keep,),
+                )
+            print(f"[CLIP] stored in DB for durability ({out_path.stat().st_size/1048576:.1f} MB)")
+        else:
+            print("[CLIP] too big for DB storage — file only")
+    except Exception as exc:
+        print(f"[CLIP] db storage skipped: {exc}")
+
     return (
         {
             "id": clip_id,
@@ -4668,6 +4724,26 @@ def serve_clip_file(filename: str, download: int = 0):
     safe_name = Path(filename).name
     path = CLIPS_DIR / safe_name
     if not path.exists():
+        # Render wiped the disk -> hand back the copy stored in Postgres.
+        import base64 as _b64
+
+        from fastapi import Response
+
+        try:
+            with get_db() as conn:
+                row = conn.execute(
+                    "SELECT video_b64 FROM clips WHERE filename = ? AND video_b64 IS NOT NULL LIMIT 1",
+                    (safe_name,),
+                ).fetchone()
+        except Exception as exc:
+            print(f"[CLIP] db read failed: {exc}")
+            row = None
+        if row and row["video_b64"]:
+            headers = {}
+            if download:
+                headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+            return Response(content=_b64.b64decode(row["video_b64"]), media_type="video/mp4",
+                            headers=headers)
         raise HTTPException(status_code=404, detail="Clip file not found.")
     headers = {}
     if download:
