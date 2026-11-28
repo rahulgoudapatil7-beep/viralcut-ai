@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-27-viral-tdh"
+BUILD_TAG = "2026-11-28-groq-asr-tdh"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -1305,6 +1305,35 @@ TITLE_NOISE = {
     "video", "videos", "full", "hd", "hq", "mp4", "mkv", "new", "latest", "official",
     "watch", "download", "free", "song", "movie", "whatsapp", "status", "clip", "clips",
 }
+TAG_NOISE = TITLE_NOISE | {
+    "tested", "moment", "viral", "highlight", "going", "part", "reality", "upcoming",
+    "this", "that", "they", "them", "then", "with", "from", "have", "will", "just",
+    "like", "what", "when", "your", "about", "into", "very", "much", "even", "only",
+}
+
+# Optional free AI writer (Groq / Gemini). Without a key the template engine is used.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL_NAME = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT_SEC", "25"))
+
+TDH_SYSTEM_PROMPT = (
+    "You are a YouTube Shorts and Instagram Reels growth strategist who writes "
+    "metadata that gets real views. You always answer with a single JSON object."
+)
+
+
+def llm_tdh_enabled() -> bool:
+    return bool(GROQ_API_KEY or GEMINI_API_KEY)
+
+
+def llm_backend() -> str:
+    if GROQ_API_KEY:
+        return "groq"
+    if GEMINI_API_KEY:
+        return "gemini"
+    return "none"
 
 
 def clean_source_topic(raw: str) -> str:
@@ -1327,10 +1356,12 @@ def clean_source_topic(raw: str) -> str:
     words = [w for w in text.split() if w.lower().strip(".,!?") not in TITLE_NOISE]
     text = " ".join(words).strip()
     text = re.sub(r"\bi\b", "I", text)
+    if not text or re.fullmatch(r"[\d\s.\-_]+", text):
+        return "This clip"
     return text[:90].strip() or "This clip"
 
 
-def _topic_keywords(text: str, limit: int = 3) -> list[str]:
+def _topic_keywords(text: str, limit: int = 4) -> list[str]:
     """Pull the most meaningful words out of a topic or spoken line."""
     if not text:
         return []
@@ -1339,16 +1370,16 @@ def _topic_keywords(text: str, limit: int = 3) -> list[str]:
     order: list[str] = []
     for w in words:
         low = w.lower()
-        if low in STOP_WORDS or low in TITLE_NOISE or low.isdigit():
+        if low in STOP_WORDS or low in TAG_NOISE or low.isdigit():
             continue
         if low not in counts:
             order.append(w)
         counts[low] = counts.get(low, 0) + 1
-    ranked = sorted(order, key=lambda w: (-len(w), -counts[w.lower()], order.index(w)))
+    ranked = sorted(order, key=lambda w: (-counts[w.lower()], -len(w), order.index(w)))
     return ranked[:limit]
 
 
-def _clean_speech(text: str, max_words: int = 10) -> str:
+def _clean_speech(text: str, max_words: int = 12) -> str:
     txt = re.sub(r"\s+", " ", EMOJI_RE.sub(" ", str(text or ""))).strip()
     txt = re.sub(r"\b(?:um+|uh+|like|you know|so yeah)\b[, ]*", " ", txt, flags=re.I)
     words = txt.split()
@@ -1357,27 +1388,151 @@ def _clean_speech(text: str, max_words: int = 10) -> str:
     return " ".join(words[:max_words]).strip(" ,;:-")
 
 
+def _speech_sentences(spoken: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", str(spoken or "").strip())
+    return [p.strip(" ,;:-") for p in parts if len(p.split()) >= 4]
+
+
+def _build_hashtags(topic: str, spoken: str, lang: str, limit: int = 12) -> list[str]:
+    tags: list[str] = []
+    seen: set[str] = set()
+
+    def _push(word: str) -> None:
+        clean = re.sub(r"[^\w\u0900-\u097F]", "", word)
+        if len(clean) < 3 or clean.isdigit():
+            return
+        tag = "#" + clean.title()
+        if tag.lower() not in seen:
+            seen.add(tag.lower())
+            tags.append(tag)
+
+    for w in _topic_keywords(topic, 4):
+        _push(w)
+    for w in _topic_keywords(spoken, 4):
+        _push(w)
+
+    platform = ["#Shorts", "#Reels", "#Viral", "#Trending", "#Explore", "#FYP",
+                "#ViralClips", "#ShortsFeed", "#InstaReels", "#DailyShorts"]
+    if str(lang).lower().startswith("hi"):
+        platform.insert(1, "#HindiShorts")
+    for p in platform:
+        if p.lower() not in seen:
+            seen.add(p.lower())
+            tags.append(p)
+    return tags[:limit]
+
+
+def _llm_tdh(topic: str, spoken: str, duration_sec: float, lang: str) -> dict[str, Any] | None:
+    """Ask a free LLM (Groq/Gemini) for real, human-quality metadata."""
+    if not llm_tdh_enabled():
+        return None
+    lang_name = "Hindi (write hashtags/keywords in English roman script, title may mix Hindi+English)" \
+        if str(lang).lower().startswith("hi") else "English"
+    user_prompt = (
+        "Write metadata for ONE vertical short clip.\n"
+        f"Clip length: {int(round(duration_sec))} seconds.\n"
+        f"Original video context: {topic}\n"
+        f"Spoken content of THIS clip (automatic transcript, may contain small errors):\n"
+        f"\"\"\"{spoken[:1200] or '(no speech — silent or music-only clip)'}\"\"\"\n"
+        f"Language of the speech: {lang_name}\n\n"
+        "Rules:\n"
+        "- title: max 80 characters, a real hook that matches what is actually said. No lies, no ALL CAPS spam, 0-2 emojis max.\n"
+        "- description: 3-5 short lines. Line 1 = hook. Then 1-2 lines explaining what happens in the clip "
+        "(specific, mention the actual subject). Then a call to action (comment/share/follow). Then a blank line. "
+        "Keep it under 600 characters.\n"
+        "- hashtags: 10-12 relevant tags, each starting with #, mixing niche topic tags with "
+        "#Shorts #Reels #Viral #Trending. camelCase words, no spaces.\n"
+        'Return ONLY JSON: {"title": "...", "description": "...", "hashtags": ["#a", "#b"]}'
+    )
+    payload = {"model": GROQ_MODEL_NAME,
+               "messages": [{"role": "system", "content": TDH_SYSTEM_PROMPT},
+                            {"role": "user", "content": user_prompt}],
+               "temperature": 0.8, "max_tokens": 700,
+               "response_format": {"type": "json_object"}}
+    try:
+        if GROQ_API_KEY:
+            r = httpx.post(
+                f"{GROQ_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json=payload, timeout=LLM_TIMEOUT,
+            )
+            r.raise_for_status()
+            raw = r.json()["choices"][0]["message"]["content"]
+        else:
+            gpayload = {
+                "contents": [{"parts": [{"text": TDH_SYSTEM_PROMPT + "\n\n" + user_prompt}]}],
+                "generationConfig": {"temperature": 0.85, "maxOutputTokens": 900,
+                                     "responseMimeType": "application/json"},
+            }
+            r = httpx.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent",
+                params={"key": GEMINI_API_KEY}, json=gpayload, timeout=LLM_TIMEOUT,
+            )
+            r.raise_for_status()
+            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", raw).strip()
+        start_i, end_i = raw.find("{"), raw.rfind("}")
+        if start_i >= 0 and end_i > start_i:
+            raw = raw[start_i:end_i + 1]
+        data = json.loads(raw)
+
+        title = str(data.get("title", "")).strip()
+        desc = str(data.get("description", "")).strip()
+        tags_in = data.get("hashtags") or []
+        if isinstance(tags_in, str):
+            tags_in = re.split(r"[,\s]+", tags_in)
+        tags: list[str] = []
+        seen: set[str] = set()
+        for t in tags_in:
+            t = re.sub(r"[^\w\u0900-\u097F#]", "", str(t)).lstrip("#")
+            if len(t) < 3:
+                continue
+            tag = "#" + t[0].upper() + t[1:]
+            if tag.lower() not in seen:
+                seen.add(tag.lower())
+                tags.append(tag)
+        if not title or not desc:
+            return None
+        if len(title) > 100:
+            title = title[:97].rstrip(" ,;:-") + "\u2026"
+        if len(tags) < 6:
+            return None
+        print(f"[TDH] {llm_backend()} wrote: {title[:60]}")
+        return {"viral_title": title, "description": desc, "hashtags": tags[:12]}
+    except Exception as exc:
+        print(f"[TDH] LLM unavailable ({type(exc).__name__}: {str(exc)[:120]}) — using template engine")
+        return None
+
+
 def build_viral_tdh(
     topic: str,
     spoken_text: str = "",
     rank: int = 1,
     duration_sec: float = 30.0,
     lang: str = "en",
+    use_llm: bool = True,
 ) -> dict[str, Any]:
     """Human-quality Title / Description / Hashtags for a Short or Reel."""
     clean_topic = clean_source_topic(topic)
-    kw = _topic_keywords(clean_topic, 4)
-    # Short, readable subject phrase (what the title is actually about)
+    spoken = re.sub(r"\s+", " ", str(spoken_text or "")).strip()
+
+    if use_llm and spoken and llm_tdh_enabled():
+        ai = _llm_tdh(clean_topic, spoken, duration_sec, lang)
+        if ai:
+            return ai
+
     short_topic = clean_topic
     if len(short_topic) > 52:
-        cut = short_topic[:52].rsplit(" ", 1)[0]
-        short_topic = cut.rstrip(" ,;:-")
-    short_topic = short_topic[:1].upper() + short_topic[1:] if short_topic else "This clip"
+        short_topic = short_topic[:52].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    short_topic = (short_topic[:1].upper() + short_topic[1:]) if short_topic else "This clip"
 
-    # Best single keyword for hashtags / CTA (prefer specific + long words)
+    kw = _topic_keywords(clean_topic, 4) or _topic_keywords(spoken, 4)
     specific = [w for w in kw if len(w) >= 4]
     focus = max(specific, key=len).title() if specific else (kw[0].title() if kw else "Viral")
-    quote = _clean_speech(spoken_text, 7)
+    quote = _clean_speech(spoken, 9)
 
     quote_templates = [
         '"{q}" \U0001F92F',
@@ -1401,38 +1556,39 @@ def build_viral_tdh(
     if len(title) > 95:
         title = title[:92].rstrip(" ,;:-") + "\u2026"
 
-    hashtags: list[str] = []
-    seen: set[str] = set()
-    tag_words = [w for w in kw if w.lower() not in {"tested", "moment", "viral", "highlight", "going", "part", "reality", "upcoming"}]
-    for w in (tag_words or kw):
-        tag = "#" + re.sub(r"[^\w\u0900-\u097F]", "", w).title()
-        if len(tag) > 3 and tag.lower() not in seen:
-            seen.add(tag.lower())
-            hashtags.append(tag)
-    platform = ["#Shorts", "#Reels", "#Viral", "#Trending", "#Explore", "#FYP", "#ViralClips"]
-    if str(lang).lower().startswith("hi"):
-        platform.insert(1, "#HindiShorts")
-    for p in platform:
-        if p.lower() not in seen:
-            seen.add(p.lower())
-            hashtags.append(p)
-    hashtags = hashtags[:8]
+    hashtags = _build_hashtags(clean_topic, spoken, lang, limit=12)
 
-    if quote:
-        context_line = short_topic + ' \u2014 the moment they said: "' + quote + '"'
+    # Description: hook, what happens, why it matters, CTA, tags.
+    lines: list[str] = [title]
+    sentences = _speech_sentences(spoken)
+    if sentences:
+        recap = sentences[0]
+        for s in sentences[1:]:
+            if len(recap) + len(s) < 220:
+                recap += " " + s
+            else:
+                break
+        lines.append("")
+        lines.append("\U0001F3AC " + recap[:230].strip())
+        if len(sentences) > 1 and len(lines[-1]) < 120:
+            extra = sentences[-1]
+            if extra not in recap:
+                lines.append("\U0001F4A5 " + extra[:180].strip())
+        lines.append("")
+        lines.append("Why watch: this is the " + str(int(round(duration_sec))) + "s version you can actually finish \u2014 save it before it's gone.")
     else:
-        context_line = short_topic + " \u2014 the " + str(int(round(duration_sec))) + "s highlight everyone is sharing."
+        lines.append("")
+        lines.append("\U0001F3AC " + short_topic + " \u2014 the " + str(int(round(duration_sec))) + "s cut everyone is sharing.")
+        lines.append("No filler, straight to the best part.")
+        lines.append("")
+        lines.append("Why watch: short, sharp and impossible to scroll past.")
+    lines.append("")
+    lines.append("\u27A1\uFE0F Follow for more " + focus + " content")
+    lines.append("\U0001F4CC Save this & comment your take below")
+    lines.append("")
+    lines.append(" ".join(hashtags[:10]))
+    description = "\n".join(lines)[:900]
 
-    description = "\n".join(
-        [
-            title,
-            context_line,
-            "\u27A1\uFE0F Follow for more " + focus + " clips like this",
-            "\U0001F4CC Save this & comment what you think!",
-            "",
-            " ".join(hashtags[:5]),
-        ]
-    )
     return {"viral_title": title, "description": description, "hashtags": hashtags}
 
 def generate_clip_metadata(
@@ -2421,6 +2577,11 @@ def health(proxy: int = 0):
         "db_warning": DB_WARNING or (None if not _PG_FAILED else "Postgres unreachable — using temporary SQLite."),
         "auto_captions": _whisper_available(),
         "whisper_model": WHISPER_MODEL_SIZE,
+        "whisper_model_non_en": WHISPER_MODEL_NON_EN,
+        "asr_forced_language": WHISPER_FORCE_LANG or "auto",
+        "analyze_asr": os.getenv("ANALYZE_ASR", "1").strip().lower() in ("1", "true", "yes"),
+        "llm_tdh": llm_backend(),
+        "asr_backend": asr_backend(),
         "proxy_configured": bool(PROXY_URL),
         "active_proxy": _mask_proxy(get_active_proxy()) if get_active_proxy() else None,
         "free_proxy_pool": {
@@ -2804,7 +2965,7 @@ def analyze_video(body: AnalyzeRequest, user: dict[str, Any] = Depends(get_curre
     if not suggestions:
         raise HTTPException(status_code=400, detail="Transcript was too short to detect viral moments.")
 
-    top_score = max(s["score"] for s in suggestions)
+
     now = datetime.now(timezone.utc).isoformat()
 
     with get_db() as conn:
@@ -2852,49 +3013,73 @@ def analyze_video(body: AnalyzeRequest, user: dict[str, Any] = Depends(get_curre
 # ---------------- AUTO CAPTIONS (offline Whisper) ----------------
 # Uploads rarely come with .srt files, so the "Captions: ON" toggle had nothing to
 # burn. We now transcribe the clip's own audio (30-60s) at cut time with
-# faster-whisper's tiny model — fast even on a 0.1 CPU, no API key needed.
+# faster-whisper on CPU. English is fine on 'tiny'; Hindi/other languages need a
+# bigger model and an explicit language, otherwise auto-detect guesses wrong and the
+# captions come out as gibberish in the wrong script.
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "tiny")
-# Free hosting has 512 MB RAM. The tiny model peaks around ~330 MB, so by default we
-# drop it right after transcribing — FFmpeg then gets the memory back for encoding.
+WHISPER_MODEL_NON_EN = os.getenv("WHISPER_MODEL_NON_EN", "base")
+WHISPER_FORCE_LANG = os.getenv("ASR_LANGUAGE", "").strip().lower()  # e.g. "hi" or "en"
+# Free hosting has 512 MB RAM, so by default one model is kept in memory at a time.
 WHISPER_KEEP_LOADED = os.getenv("WHISPER_KEEP_LOADED", "0").strip().lower() in ("1", "true", "yes")
-_WHISPER = None
+
+WHISPER_HINTS = {
+    "hi": "यह वीडियो हिंदी में है। हिंदी में ही लिखें।",
+    "mr": "हे व्हिडिओ मराठीत आहे.",
+    "ta": "இந்த வீடியோ தமிழில் உள்ளது.",
+    "te": "ఈ వీడియో తెలుగులో ఉంది.",
+    "bn": "এই ভিডিওটি বাংলায়।",
+    "gu": "આ વિડિયો ગુજરાતીમાં છે.",
+    "kn": "ಈ ವೀಡಿಯೊ ಕನ್ನಡದಲ್ಲಿದೆ.",
+    "ml": "ഈ വീഡിയോ മലയാളത്തിലാണ്.",
+    "pa": "ਇਹ ਵੀਡੀਓ ਪੰਜਾਬੀ ਵਿੱਚ ਹੈ।",
+}
+
+_WHISPER_CACHE: dict[str, Any] = {}
 _WHISPER_locked_off = False
 _WHISPER_LOCK = threading.Lock()
 
 
-def _whisper_model():
-    global _WHISPER, _WHISPER_locked_off
+def _whisper_model(size: str | None = None):
+    """Load (and cache) one Whisper model; older models are dropped to save RAM."""
+    global _WHISPER_locked_off
+    size = (size or WHISPER_MODEL_SIZE or "tiny").strip()
     with _WHISPER_LOCK:
-        if _WHISPER is not None:
-            return _WHISPER
+        if size in _WHISPER_CACHE:
+            return _WHISPER_CACHE[size]
         if _WHISPER_locked_off:
             return None
+        # Only one model in RAM at a time (512 MB box).
+        if _WHISPER_CACHE:
+            _WHISPER_CACHE.clear()
+            import gc
+            gc.collect()
         try:
             from faster_whisper import WhisperModel
 
             cache = DATA_DIR / "whisper"
             cache.mkdir(parents=True, exist_ok=True)
-            print(f"[ASR] loading whisper '{WHISPER_MODEL_SIZE}' (first time downloads ~75 MB)...")
-            _WHISPER = WhisperModel(
-                WHISPER_MODEL_SIZE,
+            print(f"[ASR] loading whisper '{size}' (first time downloads the model)...")
+            model = WhisperModel(
+                size,
                 device="cpu",
                 compute_type="int8",
                 cpu_threads=2,
                 download_root=str(cache),
             )
-            print("[ASR] whisper ready")
+            _WHISPER_CACHE[size] = model
+            print(f"[ASR] whisper '{size}' ready")
+            return model
         except Exception as exc:
             print(f"[ASR] auto-captions unavailable ({exc}); .srt upload still works")
-            _WHISPER_locked_off = True
-            _WHISPER = None
-        return _WHISPER
+            if size == WHISPER_MODEL_SIZE:
+                _WHISPER_locked_off = True
+            return None
 
 
 def _unload_whisper() -> None:
-    global _WHISPER
     with _WHISPER_LOCK:
-        if _WHISPER is not None:
-            _WHISPER = None
+        if _WHISPER_CACHE:
+            _WHISPER_CACHE.clear()
             import gc
             gc.collect()
             print("[ASR] model unloaded to free RAM")
@@ -2908,15 +3093,132 @@ def _whisper_available() -> bool:
         return False
 
 
-def transcribe_video_section(video_path: Path, start: float, end: float) -> list[dict[str, Any]]:
-    """Transcribe just [start, end] of a local video -> transcript segments (absolute times)."""
-    model = _whisper_model()
-    if model is None or not FFMPEG_BIN or not video_path.exists():
-        return []
+def _model_for_lang(lang: str) -> str:
+    lang = (lang or "").lower()
+    if lang.startswith("en") or not lang:
+        return WHISPER_MODEL_SIZE
+    return WHISPER_MODEL_NON_EN
+
+
+def _detect_speech_language(audio) -> tuple[str, float]:
+    """Ask Whisper which language this audio is in (first ~25 s only — cheap)."""
+    if WHISPER_FORCE_LANG:
+        return WHISPER_FORCE_LANG, 1.0
+    model = _whisper_model(WHISPER_MODEL_NON_EN if WHISPER_MODEL_NON_EN != WHISPER_MODEL_SIZE else WHISPER_MODEL_SIZE)
+    if model is None:
+        return "", 0.0
     try:
-        import numpy as np
+        probe = audio[: 16000 * 25]
+        if len(probe) < 16000:
+            return "", 0.0
+        segments, info = model.transcribe(
+            probe, beam_size=1, vad_filter=True, without_timestamps=True, task="transcribe"
+        )
+        for _ in segments:  # drain so detection completes
+            pass
+        lang = getattr(info, "language", "") or ""
+        prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+        print(f"[ASR] detected language={lang or '?'} (p={prob:.2f})")
+        return lang, prob
     except Exception as exc:
-        print(f"[ASR] numpy missing: {exc}")
+        print(f"[ASR] language detection failed ({exc}) — falling back to auto")
+        return "", 0.0
+
+
+# ---------------- CLOUD ASR (free Groq Whisper) ----------------
+# Local tiny/base models are fine for English but produce garbage on Hindi inside a
+# 512 MB container. Groq's free tier runs whisper-large-v3-turbo (8 h/day free), so
+# when GROQ_API_KEY is set we transcribe there; otherwise we fall back to local.
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+GROQ_ASR_MODEL = os.getenv("GROQ_ASR_MODEL", "whisper-large-v3-turbo")
+GROQ_ASR_MAX_SEC = float(os.getenv("GROQ_ASR_MAX_SEC", "600"))  # 25 MB cap -> ~13 min at 16 kHz
+
+
+def asr_backend() -> str:
+    if GROQ_API_KEY:
+        return "groq-" + GROQ_ASR_MODEL
+    return "local-" + WHISPER_MODEL_NON_EN
+
+
+def _pcm_to_wav(raw: bytes, rate: int = 16000) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(raw)
+    return buf.getvalue()
+
+
+def _groq_transcribe_pcm(raw: bytes, lang: str = "") -> list[dict[str, Any]] | None:
+    """Transcribe 16 kHz mono PCM via Groq. Returns None if the call fails."""
+    if not GROQ_API_KEY or not raw:
+        return None
+    chunk_bytes = int(GROQ_ASR_MAX_SEC * 16000 * 2)
+    out: list[dict[str, Any]] = []
+    detected = ""
+    for offset_bytes in range(0, len(raw), chunk_bytes):
+        piece = raw[offset_bytes: offset_bytes + chunk_bytes]
+        if len(piece) < 32000:  # under 1 s — nothing useful
+            continue
+        offset = offset_bytes / 32000.0
+        data = {"model": GROQ_ASR_MODEL, "response_format": "verbose_json", "temperature": "0"}
+        if lang:
+            data["language"] = lang
+        try:
+            r = httpx.post(
+                f"{GROQ_BASE_URL}/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                data=data,
+                files={"file": ("audio.wav", _pcm_to_wav(piece), "audio/wav")},
+                timeout=240,
+            )
+            r.raise_for_status()
+            payload = r.json()
+        except Exception as exc:
+            print(f"[ASR] groq failed ({type(exc).__name__}: {str(exc)[:140]})")
+            return None
+        detected = payload.get("language") or detected
+        segs = payload.get("segments") or []
+        for s in segs:
+            text = str(s.get("text", "")).strip()
+            if not text:
+                continue
+            try:
+                s_start = float(s.get("start", 0.0))
+                s_end = float(s.get("end", s_start + 1.0))
+            except Exception:
+                continue
+            out.append(
+                {
+                    "start": round(offset + s_start, 2),
+                    "duration": round(max(0.4, s_end - s_start), 2),
+                    "text": text,
+                }
+            )
+        if not segs and payload.get("text"):
+            out.append(
+                {
+                    "start": round(offset, 2),
+                    "duration": round(max(0.4, len(piece) / 32000.0), 2),
+                    "text": str(payload["text"]).strip(),
+                }
+            )
+    if out:
+        print(f"[ASR] groq transcribed {len(raw)/32000.0:.0f}s -> {len(out)} segments (lang={detected or '?'})")
+    return out or None
+
+
+def transcribe_video_section(video_path: Path, start: float, end: float) -> list[dict[str, Any]]:
+    """Transcribe [start, end] of a local video -> transcript segments (absolute times).
+
+    Works for English AND Indian languages: detects the spoken language first, then
+    re-runs with that language forced so Hindi never comes back as Urdu/English.
+    """
+    if not FFMPEG_BIN or not video_path.exists():
         return []
 
     pad = 0.4
@@ -2930,19 +3232,60 @@ def transcribe_video_section(video_path: Path, start: float, end: float) -> list
                 "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000",
                 "-f", "s16le", "-",
             ],
-            capture_output=True, timeout=300,
+            capture_output=True, timeout=600,
         ).stdout
     except Exception as exc:
         print(f"[ASR] audio extract failed: {exc}")
         return []
     if not raw or len(raw) < 8000:
+        print("[ASR] no audio track found in this section")
         return []
 
+    # 1) Cloud ASR first when available (far better on Hindi, zero RAM cost).
+    if GROQ_API_KEY:
+        cloud = _groq_transcribe_pcm(raw, WHISPER_FORCE_LANG)
+        if cloud:
+            return [
+                {
+                    "start": round(base + seg["start"], 2),
+                    "duration": seg["duration"],
+                    "text": seg["text"],
+                }
+                for seg in cloud
+            ]
+
     try:
-        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        segments, info = model.transcribe(
-            audio, vad_filter=True, beam_size=1, condition_on_previous_text=False
-        )
+        import numpy as np
+    except Exception as exc:
+        print(f"[ASR] numpy missing, cannot use local whisper: {exc}")
+        return []
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    # 2) Local fallback: which language are they speaking?
+    lang, prob = _detect_speech_language(audio)
+
+    # 2) Transcribe with the right model + language, using accuracy-first settings.
+    model = _whisper_model(_model_for_lang(lang))
+    if model is None:
+        return []
+    if lang and prob < 0.45:
+        print(f"[ASR] low confidence on '{lang}' ({prob:.2f}) — keeping it anyway")
+
+    kwargs: dict[str, Any] = {
+        "vad_filter": True,
+        "beam_size": 5,
+        "condition_on_previous_text": False,  # stops runaway hallucination loops
+        "temperature": [0.0, 0.2],
+        "no_speech_threshold": 0.6,
+        "compression_ratio_threshold": 2.4,
+        "task": "transcribe",  # never translate Indian languages into English
+    }
+    if lang:
+        kwargs["language"] = lang
+        # No Hindi script prompt: small models echo it straight into the captions.
+
+    try:
+        segments, info = model.transcribe(audio, **kwargs)
         out: list[dict[str, Any]] = []
         for seg in segments:
             text = (seg.text or "").strip()
@@ -2955,7 +3298,8 @@ def transcribe_video_section(video_path: Path, start: float, end: float) -> list
                     "text": text,
                 }
             )
-        print(f"[ASR] transcribed {dur:.0f}s -> {len(out)} segments (lang={getattr(info, 'language', '?')})")
+        used = getattr(info, "language", lang) or lang
+        print(f"[ASR] transcribed {dur:.0f}s -> {len(out)} segments (lang={used}, model={_model_for_lang(lang)})")
         return out
     except Exception as exc:
         print(f"[ASR] transcribe failed: {exc}")
@@ -2963,7 +3307,6 @@ def transcribe_video_section(video_path: Path, start: float, end: float) -> list
     finally:
         if not WHISPER_KEEP_LOADED:
             _unload_whisper()
-
 
 def probe_local_duration(video_path: Path) -> float:
     """Duration via header scan, then fall back to a real decode if the header is missing."""
@@ -3571,6 +3914,24 @@ def _job_update(job_id: str, **fields: Any) -> None:
             job["updated_at"] = time.time()
 
 
+def _transcript_covers(transcript: list[dict[str, Any]], start: float, end: float) -> bool:
+    """True if we already have subtitle lines overlapping [start, end]."""
+    if not transcript:
+        return False
+    hits = 0
+    for seg in transcript:
+        try:
+            s_start = float(seg.get("start", 0.0))
+            s_dur = float(seg.get("duration", 0.0))
+        except Exception:
+            continue
+        if s_start < end and (s_start + s_dur) > start:
+            hits += 1
+        if hits >= 2:
+            return True
+    return hits >= 1
+
+
 def _spoken_for_range(
     transcript: list[dict[str, Any]], start: float, end: float, max_chars: int = 400
 ) -> str:
@@ -3612,10 +3973,12 @@ def _perform_cut(
             fname = str(proj["url"]).replace("upload://", "", 1)
             local_src = UPLOADS_DIR / Path(fname).name
             # Captions ON but no .srt uploaded? Transcribe the clip's own audio.
-            if body.captions and not transcript:
+            if not _transcript_covers(transcript, body.start, body.end):
                 if callable(progress):
-                    progress("No subtitle file found — auto-generating captions from the audio...")
-                transcript = transcribe_video_section(local_src, body.start, body.end)
+                    progress("Listening to this part of the video for accurate captions...")
+                extra = transcribe_video_section(local_src, body.start, body.end)
+                if extra:
+                    transcript = sorted((transcript or []) + extra, key=lambda s: s["start"])
             out_path, has_cc, note = cut_uploaded_section(
                 local_src,
                 proj["video_id"],
@@ -3770,6 +4133,35 @@ def _perform_upload(
         suggestions = _even_suggestions(duration, clip_length, max_clips, clean_title)
     if not suggestions:
         raise RuntimeError("Video is too short to generate clips (need at least ~5 seconds).")
+
+    # ---- Listen to the video so every clip's Title/Description/Hashtags is real ----
+    _analyse_asr = os.getenv("ANALYZE_ASR", "1").strip().lower() in ("1", "true", "yes")
+    if not transcript and _analyse_asr and (_whisper_available() or GROQ_API_KEY):
+        cap = min(duration, float(os.getenv("ANALYZE_ASR_MAX_SEC", "600")))
+        _p(f"Listening to the audio to write accurate titles ({cap/60:.1f} min)...")
+        try:
+            heard = transcribe_video_section(saved_path, 0, cap)
+        except Exception as exc:
+            print(f"[UPLOAD] analyse-ASR failed ({exc}); titles stay template-based")
+            heard = []
+        if heard:
+            transcript = heard
+            speech_lang = _guess_lang(heard)
+            for idx, sug in enumerate(suggestions, start=1):
+                spoken = _spoken_for_range(heard, sug["start"], sug["end"])
+                if not spoken:
+                    continue
+                meta_tdh = build_viral_tdh(
+                    clean_title, spoken, rank=idx,
+                    duration_sec=max(1.0, sug["end"] - sug["start"]), lang=speech_lang,
+                    use_llm=idx <= int(os.getenv("LLM_MAX_CALLS", "10")),
+                )
+                sug["title"] = meta_tdh["viral_title"]
+                sug["description"] = meta_tdh["description"]
+                sug["hashtags"] = meta_tdh["hashtags"]
+            print(f"[UPLOAD] TDH grounded in speech for {sum(1 for s in suggestions if s.get('description'))} clips")
+        else:
+            _p("Could not hear clear speech — using topic-based titles.")
 
     top_score = max(s["score"] for s in suggestions)
     now = datetime.now(timezone.utc).isoformat()
