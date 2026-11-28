@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-29-caption-sync-fix"
+BUILD_TAG = "2026-11-29-sync-selfheal"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -3393,6 +3393,7 @@ def transcribe_video_section(video_path: Path, start: float, end: float) -> list
     kwargs: dict[str, Any] = {
         "vad_filter": True,
         "beam_size": 5,
+        "word_timestamps": True,
         "condition_on_previous_text": False,  # stops runaway hallucination loops
         "temperature": [0.0, 0.2],
         "no_speech_threshold": 0.6,
@@ -3410,13 +3411,26 @@ def transcribe_video_section(video_path: Path, start: float, end: float) -> list
             text = (seg.text or "").strip()
             if not text:
                 continue
-            out.append(
-                {
-                    "start": round(base + float(seg.start), 2),
-                    "duration": round(max(0.4, float(seg.end) - float(seg.start)), 2),
-                    "text": text,
-                }
-            )
+            item: dict[str, Any] = {
+                "start": round(base + float(seg.start), 2),
+                "duration": round(max(0.4, float(seg.end) - float(seg.start)), 2),
+                "text": text,
+            }
+            seg_words = []
+            for w in (getattr(seg, "words", None) or []):
+                w_text = (getattr(w, "word", "") or "").strip()
+                if not w_text:
+                    continue
+                seg_words.append(
+                    {
+                        "w": w_text,
+                        "s": round(base + float(getattr(w, "start", seg.start)), 3),
+                        "e": round(base + float(getattr(w, "end", seg.end)), 3),
+                    }
+                )
+            if seg_words:
+                item["words"] = seg_words
+            out.append(item)
         used = getattr(info, "language", lang) or lang
         print(f"[ASR] transcribed {dur:.0f}s -> {len(out)} segments (lang={used}, model={_model_for_lang(lang)})")
         return out
@@ -4033,6 +4047,28 @@ def _job_update(job_id: str, **fields: Any) -> None:
             job["updated_at"] = time.time()
 
 
+def _needs_word_upgrade(transcript: list[dict[str, Any]], start: float, end: float) -> bool:
+    """True when the cached transcript has no word timings for this window.
+
+    Older projects were saved before word timings existed; without them captions
+    fall back to estimated spacing and appear too early/late.
+    """
+    if not transcript:
+        return False
+    overlapping = []
+    for seg in transcript:
+        try:
+            s_start = float(seg.get("start", 0.0))
+            s_end = s_start + float(seg.get("duration", 0.0))
+        except Exception:
+            continue
+        if s_start < end and s_end > start:
+            overlapping.append(seg)
+    if not overlapping:
+        return False
+    return not any(seg.get("words") for seg in overlapping)
+
+
 def _transcript_covers(transcript: list[dict[str, Any]], start: float, end: float) -> bool:
     """True if we already have subtitle lines overlapping [start, end]."""
     if not transcript:
@@ -4092,12 +4128,34 @@ def _perform_cut(
             fname = str(proj["url"]).replace("upload://", "", 1)
             local_src = UPLOADS_DIR / Path(fname).name
             # Captions ON but no .srt uploaded? Transcribe the clip's own audio.
-            if not _transcript_covers(transcript, body.start, body.end):
+            # Also re-do older transcripts that have no word timings (they would
+            # otherwise burn captions with estimated spacing = early captions).
+            need_asr = (not _transcript_covers(transcript, body.start, body.end)) or _needs_word_upgrade(
+                transcript, body.start, body.end
+            )
+            if need_asr and (GROQ_API_KEY or _whisper_available()):
                 if callable(progress):
-                    progress("Listening to this part of the video for accurate captions...")
+                    progress("Syncing captions to the voice...")
                 extra = transcribe_video_section(local_src, body.start, body.end)
                 if extra:
-                    transcript = sorted((transcript or []) + extra, key=lambda s: s["start"])
+                    pad = 3.0
+                    kept = [
+                        s for s in (transcript or [])
+                        if not (
+                            float(s.get("start", 0.0)) + float(s.get("duration", 0.0)) > body.start - pad
+                            and float(s.get("start", 0.0)) < body.end + pad
+                        )
+                    ]
+                    transcript = sorted(kept + extra, key=lambda s: float(s.get("start", 0.0)))
+                    try:
+                        with get_db() as conn:
+                            conn.execute(
+                                "UPDATE projects SET transcript_json = ? WHERE id = ?",
+                                (json.dumps(transcript), proj["id"]),
+                            )
+                        print(f"[ASR] transcript upgraded with word timings for project {proj['id']}")
+                    except Exception as exc:
+                        print(f"[ASR] could not save upgraded transcript: {exc}")
             out_path, has_cc, note = cut_uploaded_section(
                 local_src,
                 proj["video_id"],
