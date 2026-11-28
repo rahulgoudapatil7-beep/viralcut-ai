@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
@@ -67,6 +68,16 @@ ADMIN_EMAILS = {"rahulgoudapatil7@gmail.com"}
 # Create a 16-character Google App Password at: https://myaccount.google.com/apppasswords
 SMTP_EMAIL = os.getenv("SMTP_EMAIL", "rahulgoudapatil7@gmail.com")
 SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")  # Paste your 16-char Gmail App Password here (no spaces)
+# Render's FREE plan blocks outbound SMTP (ports 25/465/587), so email MUST go out over
+# HTTPS. Set ONE of these on Render -> Environment and email starts working:
+#   BREVO_API_KEY      (recommended, free 300/day, https://app.brevo.com)
+#   SENDGRID_API_KEY   (free 100/day)
+#   RESEND_API_KEY     (needs a verified domain)
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+MAIL_FROM = os.getenv("MAIL_FROM", SMTP_EMAIL).strip()
+MAIL_FROM_NAME = os.getenv("MAIL_FROM_NAME", "ViralCut AI").strip()
 
 # CLOUD YOUTUBE BYPASS (for Render/Railway where YouTube blocks datacenter IPs)
 # Option A: Set PROXY_URL env var in Render (e.g. http://user:pass@p.webshare.io:80)
@@ -316,7 +327,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-29-block-fix"
+BUILD_TAG = "2026-11-29-https-email"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -2724,7 +2735,8 @@ def health(proxy: int = 0):
         "low_cpu_mode": LOW_CPU,
         "max_upload_mb": MAX_UPLOAD_MB,
         "disk_free_mb": round(_free_mb(), 1),
-        "email_verification": "on (gmail otp)" if smtp_ready() else "off - set SMTP_APP_PASSWORD on Render",
+        "email_verification": f"on ({email_provider()})" if smtp_ready() else "off - no email provider configured",
+        "email_provider": email_provider(),
         "build": BUILD_TAG,
     }
     if proxy:
@@ -2791,9 +2803,119 @@ VERIFY_MAX_ATTEMPTS = int(os.getenv("VERIFY_MAX_ATTEMPTS", "5"))
 VERIFY_RESEND_SECONDS = int(os.getenv("VERIFY_RESEND_SECONDS", "60"))
 
 
+def email_provider() -> str:
+    """Which transport will deliver mail: brevo / sendgrid / resend / smtp / none."""
+    if BREVO_API_KEY:
+        return "brevo"
+    if SENDGRID_API_KEY:
+        return "sendgrid"
+    if RESEND_API_KEY:
+        return "resend"
+    if SMTP_EMAIL.strip() and SMTP_APP_PASSWORD.replace(" ", "").strip():
+        return "smtp"
+    return "none"
+
+
 def smtp_ready() -> bool:
-    """True when a Gmail app password is configured (needed to actually email an OTP)."""
-    return bool(SMTP_EMAIL.strip() and SMTP_APP_PASSWORD.replace(" ", "").strip())
+    """Kept for older call sites: True when ANY email transport is configured."""
+    return email_provider() != "none"
+
+
+def _http_json(url: str, payload: dict, headers: dict, timeout: int = 25) -> str:
+    """POST JSON over HTTPS. Raises RuntimeError with the provider's own message on failure."""
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return f"{resp.status} {resp.read().decode('utf-8', 'ignore')[:200]}"
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "ignore")[:400]
+        raise RuntimeError(f"{exc.code} {detail}")
+    except Exception as exc:
+        raise RuntimeError(f"{type(exc).__name__}: {exc}")
+
+
+def send_email_message(to_email: str, to_name: str, subject: str, text: str, html: str) -> str:
+    """Send one email through whichever provider is configured. Returns a short status string."""
+    provider = email_provider()
+    sender = MAIL_FROM or SMTP_EMAIL
+
+    if provider == "brevo":
+        return _http_json(
+            "https://api.brevo.com/v3/smtp/email",
+            {
+                "sender": {"email": sender, "name": MAIL_FROM_NAME},
+                "to": [{"email": to_email, "name": to_name or to_email}],
+                "subject": subject,
+                "htmlContent": html,
+                "textContent": text,
+            },
+            {"api-key": BREVO_API_KEY, "accept": "application/json"},
+        )
+
+    if provider == "sendgrid":
+        return _http_json(
+            "https://api.sendgrid.com/v3/mail/send",
+            {
+                "personalizations": [{"to": [{"email": to_email, "name": to_name or to_email}]}],
+                "from": {"email": sender, "name": MAIL_FROM_NAME},
+                "subject": subject,
+                "content": [
+                    {"type": "text/plain", "value": text},
+                    {"type": "text/html", "value": html},
+                ],
+            },
+            {"Authorization": f"Bearer {SENDGRID_API_KEY}"},
+        )
+
+    if provider == "resend":
+        return _http_json(
+            "https://api.resend.com/emails",
+            {
+                "from": f"{MAIL_FROM_NAME} <{sender}>",
+                "to": [to_email],
+                "subject": subject,
+                "html": html,
+                "text": text,
+            },
+            {"Authorization": f"Bearer {RESEND_API_KEY}"},
+        )
+
+    if provider == "smtp":
+        app_pw = SMTP_APP_PASSWORD.replace(" ", "").strip()
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = f"{MAIL_FROM_NAME} <{sender}>"
+        msg["To"] = to_email
+        msg.set_content(text)
+        msg.add_alternative(html, subtype="html")
+        last_err = None
+        for port, use_ssl in ((465, True), (587, False)):
+            try:
+                if use_ssl:
+                    with smtplib.SMTP_SSL("smtp.gmail.com", port, timeout=20) as smtp:
+                        smtp.login(sender, app_pw)
+                        smtp.send_message(msg)
+                else:
+                    with smtplib.SMTP("smtp.gmail.com", port, timeout=20) as smtp:
+                        smtp.starttls()
+                        smtp.login(sender, app_pw)
+                        smtp.send_message(msg)
+                return f"smtp:{port} sent"
+            except Exception as exc:
+                last_err = exc
+                print(f"[MAIL] smtp port {port} failed: {exc}")
+        raise RuntimeError(
+            f"SMTP failed on 465 and 587 ({last_err}). NOTE: Render's FREE plan blocks all "
+            f"SMTP ports - set BREVO_API_KEY on Render instead."
+        )
+
+    raise RuntimeError(
+        "No email provider configured. Add BREVO_API_KEY on Render (free, 300 emails/day)."
+    )
 
 
 def _gen_otp() -> str:
@@ -2801,19 +2923,9 @@ def _gen_otp() -> str:
 
 
 def send_verify_email(to_email: str, user_name: str, code: str) -> None:
-    """Email the 6-digit sign-up verification code via Gmail SMTP (SSL 465)."""
-    app_pw = SMTP_APP_PASSWORD.replace(" ", "").strip()
-    sender = SMTP_EMAIL.strip()
-    if not sender or not app_pw:
-        raise RuntimeError(
-            "Gmail SMTP is not configured. Add a 16-character Google App Password "
-            "to the SMTP_APP_PASSWORD env var on Render."
-        )
-    msg = EmailMessage()
-    msg["Subject"] = f"{code} is your ViralCut AI verification code"
-    msg["From"] = f"ViralCut AI <{sender}>"
-    msg["To"] = to_email
-    msg.set_content(
+    """Email the 6-digit sign-up verification code."""
+    subject = f"{code} is your ViralCut AI verification code"
+    text = (
         f"Hi {user_name},\n\n"
         f"Your ViralCut AI verification code is: {code}\n\n"
         f"Enter it on the sign-up screen to activate your account. "
@@ -2821,8 +2933,7 @@ def send_verify_email(to_email: str, user_name: str, code: str) -> None:
         f"If you did not sign up, ignore this email - no account will be activated.\n\n"
         f"- ViralCut AI"
     )
-    msg.add_alternative(
-        f"""
+    html = f"""
         <div style="font-family:Inter,Arial,sans-serif;background:#090912;color:#f5f3ff;padding:32px;border-radius:14px;max-width:480px;margin:auto;">
           <h2 style="margin:0 0 8px;color:#ffffff;">ViralCut <span style="color:#a66aff;">AI</span></h2>
           <p style="color:#b8b5cf;font-size:14px;">Hi {user_name},</p>
@@ -2835,12 +2946,9 @@ def send_verify_email(to_email: str, user_name: str, code: str) -> None:
           </div>
           <p style="color:#8f8ca8;font-size:12px;">If you didn't sign up for ViralCut AI, you can safely ignore this email.</p>
         </div>
-        """,
-        subtype="html",
-    )
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
-        smtp.login(sender, app_pw)
-        smtp.send_message(msg)
+        """
+    print(f"[MAIL] verification code -> {to_email} via {email_provider()}")
+    send_email_message(to_email, user_name, subject, text, html)
 
 
 def _issue_verify_code(uid: int, email: str, name: str) -> str:
@@ -3085,29 +3193,18 @@ def me(user: dict[str, Any] = Depends(get_current_user)):
 
 
 def send_reset_email(to_email: str, user_name: str, code: str) -> None:
-    """Send the 6-digit password reset code securely via Gmail SMTP (SSL port 465)."""
-    app_pw = SMTP_APP_PASSWORD.replace(" ", "").strip()
-    sender = SMTP_EMAIL.strip()
-    if not sender or not app_pw:
-        raise RuntimeError(
-            "Gmail SMTP is not configured yet. Add your 16-character Google App Password to SMTP_APP_PASSWORD in Backend/main.py."
-        )
-
-    msg = EmailMessage()
-    msg["Subject"] = f"{code} is your ViralCut AI password reset code"
-    msg["From"] = f"ViralCut AI <{sender}>"
-    msg["To"] = to_email
-    msg.set_content(
+    """Email the 6-digit password reset code."""
+    subject = f"{code} is your ViralCut AI password reset code"
+    text = (
         f"Hi {user_name},\n\n"
         f"We received a request to reset your ViralCut AI password.\n\n"
         f"Your 6-digit verification code is: {code}\n\n"
         f"This code expires in 15 minutes. If you did not request this, you can safely ignore this email.\n\n"
-        f"— ViralCut AI"
+        f"- ViralCut AI"
     )
-    msg.add_alternative(
-        f"""
+    html = f"""
         <div style="font-family:Inter,Arial,sans-serif;background:#090912;color:#f5f3ff;padding:32px;border-radius:14px;max-width:480px;margin:auto;">
-          <h2 style="margin:0 0 8px;color:#ffffff;">✂ ViralCut <span style="color:#a66aff;">AI</span></h2>
+          <h2 style="margin:0 0 8px;color:#ffffff;">ViralCut <span style="color:#a66aff;">AI</span></h2>
           <p style="color:#b8b5cf;font-size:14px;">Hi {user_name},</p>
           <p style="color:#d6d3eb;font-size:14px;line-height:1.6;">
             Use the 6-digit code below to reset your ViralCut AI password. This code expires in <strong>15 minutes</strong>.
@@ -3115,17 +3212,11 @@ def send_reset_email(to_email: str, user_name: str, code: str) -> None:
           <div style="margin:22px 0;padding:16px;text-align:center;background:#17152a;border:1px solid #4c2f8a;border-radius:12px;font-size:32px;font-weight:800;letter-spacing:8px;color:#ffd726;">
             {code}
           </div>
-          <p style="color:#8f8ca8;font-size:12px;">
-            If you didn't request a password reset, you can safely ignore this email — your account is still secure.
-          </p>
+          <p style="color:#8f8ca8;font-size:12px;">If you didn't request a password reset, you can safely ignore this email - your account is still secure.</p>
         </div>
-        """,
-        subtype="html",
-    )
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
-        smtp.login(sender, app_pw)
-        smtp.send_message(msg)
+        """
+    print(f"[MAIL] reset code -> {to_email} via {email_provider()}")
+    send_email_message(to_email, user_name, subject, text, html)
 
 
 @app.post("/api/auth/forgot-password")
@@ -3286,6 +3377,32 @@ def admin_delete_user(user_id: int, admin: dict[str, Any] = Depends(require_admi
     print(f"[ADMIN] removed user {user_id} ({target['email']}), {len(files)} clips, {len(uploads)} uploads")
     return {"deleted": True, "user_id": user_id, "email": target["email"],
             "clips_removed": len(files), "uploads_removed": len(uploads)}
+
+
+@app.get("/api/admin/email-test")
+def admin_email_test(to: str | None = None, admin: dict[str, Any] = Depends(require_admin)):
+    """ADMIN ONLY: send a test email and report exactly what the provider said."""
+    provider = email_provider()
+    target = (to or admin["email"]).strip()
+    if provider == "none":
+        return {
+            "ok": False,
+            "provider": "none",
+            "error": "No email transport configured. Add BREVO_API_KEY on Render -> Environment.",
+        }
+    try:
+        result = send_email_message(
+            target,
+            "ViralCut Admin",
+            "ViralCut AI email test",
+            "If you can read this, email delivery from ViralCut AI is working.",
+            "<p style=\"font-family:Arial,sans-serif\">If you can read this, email delivery from <strong>ViralCut AI</strong> is working.</p>",
+        )
+        print(f"[MAIL] test email to {target} via {provider}: {result}")
+        return {"ok": True, "provider": provider, "to": target, "response": result}
+    except Exception as exc:
+        print(f"[MAIL] test email FAILED via {provider}: {exc}")
+        return {"ok": False, "provider": provider, "to": target, "error": str(exc)[:500]}
 
 
 @app.get("/api/admin/users")
