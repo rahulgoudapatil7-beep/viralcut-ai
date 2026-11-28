@@ -316,7 +316,7 @@ def _pool_keeper() -> None:
 
 
 # Bumped whenever backend behaviour changes — lets us confirm what's actually deployed.
-BUILD_TAG = "2026-11-29-real-thumbnails"
+BUILD_TAG = "2026-11-29-caption-sync-fix"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -1919,6 +1919,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     for rel_start, rel_end, text, word_times in raw_items:
         # Preferred: exact per-word timings from the ASR (captions land on the beat).
+        word_times = [
+            w for w in word_times
+            if (seg_start - 1.0) <= w[1] <= (seg_end + 1.0)
+        ]
         if len(word_times) >= 2:
             for i in range(0, len(word_times), max_words_per_chunk):
                 group = word_times[i : i + max_words_per_chunk]
@@ -3347,14 +3351,27 @@ def transcribe_video_section(video_path: Path, start: float, end: float) -> list
     if GROQ_API_KEY:
         cloud = _groq_transcribe_pcm(raw, WHISPER_FORCE_LANG)
         if cloud:
-            return [
-                {
+            shifted: list[dict[str, Any]] = []
+            for seg in cloud:
+                words = seg.get("words") or []
+                item: dict[str, Any] = {
                     "start": round(base + seg["start"], 2),
                     "duration": seg["duration"],
                     "text": seg["text"],
                 }
-                for seg in cloud
-            ]
+                if words:
+                    # Word times are relative to the audio we sent -> add the same
+                    # `base` offset as the segment, or every caption runs early.
+                    item["words"] = [
+                        {
+                            "w": w["w"],
+                            "s": round(base + float(w["s"]), 3),
+                            "e": round(base + float(w["e"]), 3),
+                        }
+                        for w in words
+                    ]
+                shifted.append(item)
+            return shifted
 
     try:
         import numpy as np
@@ -4239,7 +4256,8 @@ def _perform_upload(
     # ---- Listen to the video so every clip's Title/Description/Hashtags is real ----
     _analyse_asr = os.getenv("ANALYZE_ASR", "1").strip().lower() in ("1", "true", "yes")
     if not transcript and _analyse_asr and (_whisper_available() or GROQ_API_KEY):
-        cap = min(duration, float(os.getenv("ANALYZE_ASR_MAX_SEC", "600")))
+        last_clip_end = max(float(s["end"]) for s in suggestions)
+        cap = min(duration, last_clip_end + 8.0, float(os.getenv("ANALYZE_ASR_MAX_SEC", "1500")))
         _p(f"Listening to the audio to write accurate titles ({cap/60:.1f} min)...")
         try:
             heard = transcribe_video_section(saved_path, 0, cap)
